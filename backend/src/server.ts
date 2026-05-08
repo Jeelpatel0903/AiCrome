@@ -1,4 +1,5 @@
 import './config'; // validates env vars first
+import './tools'; // registers all agent tools
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';

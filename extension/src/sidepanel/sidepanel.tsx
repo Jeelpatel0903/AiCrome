@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   onAuthStateChanged,
   signInWithPopup,
   GoogleAuthProvider,
   signInWithEmailAndPassword,
+  signOut,
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
@@ -101,7 +102,7 @@ function LoginScreen() {
       {!showEmailForm ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', width: '100%' }}>
           <button
-            onClick={handleGoogleSignIn}
+            onClick={() => void handleGoogleSignIn()}
             disabled={loading}
             style={{
               background: '#6366f1',
@@ -142,7 +143,7 @@ function LoginScreen() {
         </div>
       ) : (
         <form
-          onSubmit={handleEmailSignIn}
+          onSubmit={(e) => void handleEmailSignIn(e)}
           style={{ display: 'flex', flexDirection: 'column', gap: '12px', width: '100%' }}
         >
           <input
@@ -1015,7 +1016,11 @@ function VaultTab({ token }: VaultTabProps) {
       const res = await fetch(`${backendUrl}/vault/identities`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const json = await res.json() as { success: boolean; data?: IdentityPublic[]; error?: string };
+      const json = (await res.json()) as {
+        success: boolean;
+        data?: IdentityPublic[];
+        error?: string;
+      };
       if (!json.success) throw new Error(json.error ?? 'Failed to fetch identities');
       setIdentities(json.data ?? []);
     } catch (err: unknown) {
@@ -1116,7 +1121,7 @@ function VaultTab({ token }: VaultTabProps) {
           body: JSON.stringify(formData),
         });
       }
-      const json = await res.json() as { success: boolean; error?: string };
+      const json = (await res.json()) as { success: boolean; error?: string };
       if (!json.success) throw new Error(json.error ?? 'Save failed');
       resetForm();
       await fetchIdentities();
@@ -1134,7 +1139,7 @@ function VaultTab({ token }: VaultTabProps) {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const json = await res.json() as { success: boolean; error?: string };
+      const json = (await res.json()) as { success: boolean; error?: string };
       if (!json.success) throw new Error(json.error ?? 'Delete failed');
       setDeleteConfirmId(null);
       await fetchIdentities();
@@ -1514,13 +1519,347 @@ const inputStyle: React.CSSProperties = {
   boxSizing: 'border-box',
 };
 
+// ==================== AGENT TAB ====================
+
+interface ProgressMessage {
+  type: string;
+  message: string;
+  timestamp: string;
+}
+
+interface ProgressUpdateMsg {
+  type: string;
+  type_?: string;
+  sessionId?: string;
+  message?: string;
+  timestamp?: string;
+}
+
+interface AgentTabProps {
+  token: string;
+}
+
+function getMessageStyle(msgType: string): React.CSSProperties {
+  switch (msgType) {
+    case 'tool_start':
+      return { color: '#94a3b8', fontSize: '12px' };
+    case 'tool_success':
+      return { color: '#4ade80', fontSize: '12px' };
+    case 'tool_error':
+      return { color: '#f87171', fontSize: '12px' };
+    case 'asking':
+      return { color: '#fbbf24', fontSize: '13px' };
+    case 'complete':
+      return { color: '#4ade80', fontSize: '13px', fontWeight: 'bold' };
+    default:
+      return { color: '#e2e8f0', fontSize: '13px' };
+  }
+}
+
+function getMessagePrefix(msgType: string): string {
+  switch (msgType) {
+    case 'tool_start':
+      return '⚙️ ';
+    case 'tool_success':
+      return '✅ ';
+    case 'tool_error':
+      return '❌ ';
+    case 'asking':
+      return '❓ ';
+    case 'complete':
+      return '🎉 ';
+    default:
+      return '';
+  }
+}
+
+function getCurrentUrl(): Promise<string> {
+  return new Promise<string>((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      resolve(tabs[0]?.url || '');
+    });
+  });
+}
+
+function AgentTab({ token }: AgentTabProps) {
+  const [messages, setMessages] = useState<ProgressMessage[]>([]);
+  const [command, setCommand] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Subscribe to progress updates from background script
+  useEffect(() => {
+    const listener = (msg: ProgressUpdateMsg) => {
+      if (msg.type === 'progress_update') {
+        // Skip bridge_request messages from the feed
+        const msgType = msg.type_ || 'message';
+        if (msgType === 'bridge_request') return;
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            type: msgType,
+            message: msg.message || '',
+            timestamp: msg.timestamp || new Date().toISOString(),
+          },
+        ]);
+
+        if (msgType === 'complete' || msgType === 'error') {
+          setIsRunning(false);
+          setSessionId(null);
+        }
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    return () => chrome.runtime.onMessage.removeListener(listener);
+  }, []);
+
+  // Auto-scroll to bottom on new message
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const handleSend = async () => {
+    if (!command.trim() || isRunning) return;
+    const cmd = command.trim();
+    setCommand('');
+    setRunError(null);
+    setIsRunning(true);
+
+    const currentUrl = await getCurrentUrl();
+
+    try {
+      const res = await fetch(`${backendUrl}/agent/run`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ command: cmd, currentUrl }),
+      });
+      const json = (await res.json()) as {
+        success: boolean;
+        sessionId?: string;
+        error?: string;
+      };
+      if (!json.success) {
+        throw new Error(json.error ?? 'Failed to start agent');
+      }
+      if (json.sessionId) {
+        setSessionId(json.sessionId);
+      }
+      // Add user command to feed
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: 'user',
+          message: cmd,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setRunError(e.message ?? 'Failed to start agent');
+      setIsRunning(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (!sessionId) {
+      setIsRunning(false);
+      return;
+    }
+    try {
+      await fetch(`${backendUrl}/agent/cancel/${sessionId}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // Ignore cancel errors
+    } finally {
+      setIsRunning(false);
+      setSessionId(null);
+    }
+  };
+
+  const handleClear = () => {
+    setMessages([]);
+    setRunError(null);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Header row with Clear button */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '8px',
+        }}
+      >
+        <span style={{ fontSize: '12px', color: '#475569' }}>
+          {isRunning ? 'Agent is running...' : 'Agent ready'}
+        </span>
+        {messages.length > 0 && (
+          <button
+            onClick={handleClear}
+            style={{
+              background: 'transparent',
+              border: '1px solid #334155',
+              borderRadius: '6px',
+              padding: '3px 10px',
+              color: '#64748b',
+              cursor: 'pointer',
+              fontSize: '11px',
+            }}
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      {/* Messages feed */}
+      <div
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '6px',
+          minHeight: 0,
+        }}
+      >
+        {messages.length === 0 ? (
+          <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
+            <div style={{ fontSize: '48px', marginBottom: '12px' }}>🤖</div>
+            <p style={{ fontSize: '15px', marginBottom: '8px' }}>Welcome to DevFlow AI</p>
+            <p style={{ fontSize: '13px', color: '#334155' }}>
+              Try: &quot;DSR bhar de&quot; or &quot;Login kardo&quot;
+            </p>
+          </div>
+        ) : (
+          messages.map((msg, i) => {
+            if (msg.type === 'user') {
+              return (
+                <div
+                  key={i}
+                  style={{
+                    background: '#1e293b',
+                    borderRadius: '8px',
+                    padding: '8px 10px',
+                    fontSize: '13px',
+                    color: '#e2e8f0',
+                    borderLeft: '3px solid #6366f1',
+                  }}
+                >
+                  <span style={{ color: '#818cf8', fontWeight: 'bold', marginRight: '6px' }}>
+                    You:
+                  </span>
+                  {msg.message}
+                </div>
+              );
+            }
+            return (
+              <div
+                key={i}
+                style={{
+                  padding: '4px 6px',
+                  borderRadius: '4px',
+                  ...getMessageStyle(msg.type),
+                }}
+              >
+                {getMessagePrefix(msg.type)}
+                {msg.message}
+              </div>
+            );
+          })
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {runError && (
+        <p style={{ color: '#f87171', fontSize: '12px', margin: '6px 0 0 0' }}>{runError}</p>
+      )}
+
+      {/* Input + Cancel */}
+      <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        {isRunning && (
+          <button
+            onClick={() => void handleCancel()}
+            style={{
+              background: '#ef4444',
+              border: 'none',
+              borderRadius: '8px',
+              padding: '8px',
+              color: 'white',
+              cursor: 'pointer',
+              fontSize: '13px',
+              fontWeight: '600',
+              width: '100%',
+            }}
+          >
+            Cancel
+          </button>
+        )}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end' }}>
+          <textarea
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void handleSend();
+              }
+            }}
+            placeholder="Type a command... (Enter to send, Shift+Enter for new line)"
+            disabled={isRunning}
+            style={{
+              flex: 1,
+              background: '#0f172a',
+              border: '1px solid #334155',
+              borderRadius: '8px',
+              padding: '10px',
+              color: '#e2e8f0',
+              fontSize: '13px',
+              resize: 'none',
+              minHeight: '42px',
+              maxHeight: '120px',
+              outline: 'none',
+              opacity: isRunning ? 0.6 : 1,
+            }}
+            rows={1}
+          />
+          <button
+            onClick={() => void handleSend()}
+            disabled={isRunning || !command.trim()}
+            style={{
+              background: isRunning || !command.trim() ? '#374151' : '#6366f1',
+              border: 'none',
+              borderRadius: '8px',
+              padding: '10px 16px',
+              color: 'white',
+              cursor: isRunning || !command.trim() ? 'not-allowed' : 'pointer',
+              fontSize: '18px',
+              minWidth: '44px',
+              opacity: isRunning || !command.trim() ? 0.6 : 1,
+            }}
+          >
+            ➤
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ==================== MAIN SIDEPANEL ====================
 
 function SidePanel() {
   const { user, token, isLoading, setUser, setToken, setLoading } = useAuthStore();
   const [activeTab, setActiveTab] = useState<Tab>('agent');
-  const [command, setCommand] = useState('');
-  const [messages, setMessages] = useState<string[]>([]);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -1528,9 +1867,21 @@ function SidePanel() {
         const idToken = await firebaseUser.getIdToken();
         setUser(firebaseUser);
         setToken(idToken);
+        // Store credentials and notify background script
+        chrome.storage.local.set({ userId: firebaseUser.uid, authToken: idToken });
+        chrome.runtime
+          .sendMessage({ type: 'auth_changed', userId: firebaseUser.uid, token: idToken })
+          .catch(() => {
+            // Background may not be ready yet
+          });
       } else {
         setUser(null);
         setToken(null);
+        // Clear stored credentials and notify background script
+        chrome.storage.local.remove(['userId', 'authToken']);
+        chrome.runtime.sendMessage({ type: 'auth_logout' }).catch(() => {
+          // Background may not be ready yet
+        });
       }
       setLoading(false);
     });
@@ -1568,17 +1919,17 @@ function SidePanel() {
     return <LoginScreen />;
   }
 
-  const handleSend = () => {
-    if (!command.trim()) return;
-    setMessages((prev) => [...prev, command]);
-    setCommand('');
+  const handleLogout = async () => {
+    chrome.storage.local.remove(['userId', 'authToken']);
+    chrome.runtime.sendMessage({ type: 'auth_logout' }).catch(() => {});
+    await signOut(auth);
   };
 
   const displayName = user.displayName ?? user.email ?? 'U';
   const initial = displayName.charAt(0).toUpperCase();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0f172a' }}>
       {/* Header */}
       <div
         style={{
@@ -1592,23 +1943,27 @@ function SidePanel() {
       >
         <span style={{ fontSize: '20px' }}>🤖</span>
         <span style={{ fontWeight: 'bold', color: '#818cf8', fontSize: '16px' }}>DevFlow AI</span>
-        <div
+        <button
+          onClick={() => void handleLogout()}
+          title="Logout"
           style={{
             marginLeft: 'auto',
             width: '32px',
             height: '32px',
             borderRadius: '50%',
             background: '#6366f1',
+            border: 'none',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             fontSize: '14px',
             fontWeight: 'bold',
             color: 'white',
+            cursor: 'pointer',
           }}
         >
           {initial}
-        </div>
+        </button>
       </div>
 
       {/* Tab Bar */}
@@ -1639,38 +1994,16 @@ function SidePanel() {
       </div>
 
       {/* Content */}
-      <div style={{ flex: 1, overflow: 'auto', padding: '16px' }}>
-        {activeTab === 'agent' && (
-          <div>
-            {messages.length === 0 ? (
-              <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
-                <div style={{ fontSize: '48px', marginBottom: '12px' }}>🤖</div>
-                <p style={{ fontSize: '15px', marginBottom: '8px' }}>Welcome to DevFlow AI</p>
-                <p style={{ fontSize: '13px', color: '#334155' }}>
-                  Try: &quot;DSR bhar de&quot; or &quot;Login kardo&quot;
-                </p>
-              </div>
-            ) : (
-              messages.map((msg, i) => (
-                <div
-                  key={i}
-                  style={{
-                    background: '#1e293b',
-                    borderRadius: '8px',
-                    padding: '10px',
-                    marginBottom: '8px',
-                    fontSize: '14px',
-                  }}
-                >
-                  <span style={{ color: '#818cf8', fontWeight: 'bold', marginRight: '8px' }}>
-                    You:
-                  </span>
-                  {msg}
-                </div>
-              ))
-            )}
-          </div>
-        )}
+      <div
+        style={{
+          flex: 1,
+          overflow: activeTab === 'agent' ? 'hidden' : 'auto',
+          padding: '16px',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        {activeTab === 'agent' && token && <AgentTab token={token} />}
         {activeTab === 'memory' && token && <MemoryTab token={token} />}
         {activeTab === 'vault' && token && <VaultTab token={token} />}
         {activeTab === 'flows' && (
@@ -1687,52 +2020,6 @@ function SidePanel() {
             <p style={{ fontSize: '13px', marginTop: '8px' }}>Automate your routine tasks!</p>
           </div>
         )}
-      </div>
-
-      {/* Command Input */}
-      <div style={{ padding: '12px', background: '#1e293b', borderTop: '1px solid #334155' }}>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end' }}>
-          <textarea
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
-              }
-            }}
-            placeholder="Type a command... (Enter to send, Shift+Enter for new line)"
-            style={{
-              flex: 1,
-              background: '#0f172a',
-              border: '1px solid #334155',
-              borderRadius: '8px',
-              padding: '10px',
-              color: '#e2e8f0',
-              fontSize: '13px',
-              resize: 'none',
-              minHeight: '42px',
-              maxHeight: '120px',
-              outline: 'none',
-            }}
-            rows={1}
-          />
-          <button
-            onClick={handleSend}
-            style={{
-              background: '#6366f1',
-              border: 'none',
-              borderRadius: '8px',
-              padding: '10px 16px',
-              color: 'white',
-              cursor: 'pointer',
-              fontSize: '18px',
-              minWidth: '44px',
-            }}
-          >
-            ➤
-          </button>
-        </div>
       </div>
     </div>
   );

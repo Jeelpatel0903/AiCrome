@@ -1,0 +1,649 @@
+import { toolRegistry } from './registry';
+import type { ToolContext, ToolResult } from './registry';
+import { db } from '../services/firebase';
+import { decrypt } from '../services/encryption';
+import { randomUUID } from 'crypto';
+
+// ─── Shared types ────────────────────────────────────────────────────────────
+
+interface MemoryDocument {
+  id: string;
+  userId: string;
+  content: string;
+  type: 'preference' | 'fact' | 'rule' | 'identity_hint';
+  sitePattern?: string;
+  tags: string[];
+  lastUsed?: string;
+  useCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface IdentityDocument {
+  userId: string;
+  name: string;
+  siteUrl: string;
+  username: string;
+  passwordEncrypted: string;
+  createdAt: string;
+  updatedAt: string;
+  lastUsed: string | null;
+  deletedAt: string | null;
+}
+
+interface SitePreferenceDocument {
+  id: string;
+  userId: string;
+  sitePattern: string;
+  defaults: Record<string, string>;
+  overrideRules: { triggerKeyword: string; targetField: string; setValue: string }[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─── Memory scoring (same algorithm as memory routes) ────────────────────────
+
+function scoreMemory(
+  mem: MemoryDocument,
+  queryWords: string[],
+  url: string | undefined,
+): number {
+  let score = 0;
+
+  if (queryWords.length > 0) {
+    const contentLower = mem.content.toLowerCase();
+    const matchingWords = queryWords.filter((w) => contentLower.includes(w));
+    score += (matchingWords.length / queryWords.length) * 40;
+  }
+
+  if (mem.sitePattern && url) {
+    const normalizedUrl = url.replace(/^https?:\/\//, '').toLowerCase();
+    const pattern = mem.sitePattern.toLowerCase();
+    if (normalizedUrl.includes(pattern) || pattern.includes(normalizedUrl)) {
+      score += 30;
+    }
+  }
+
+  if (mem.lastUsed) {
+    const daysSince =
+      (Date.now() - new Date(mem.lastUsed).getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSince < 1) score += 20;
+    else if (daysSince < 7) score += 15;
+    else if (daysSince < 30) score += 10;
+  }
+
+  score += Math.min(mem.useCount * 2, 10);
+
+  return score;
+}
+
+function autoExtractTags(content: string, userTags: string[]): string[] {
+  const words = content.split(/\s+/);
+  const extracted = words
+    .filter((w) => w.length > 4)
+    .map((w) => w.toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .filter((w) => w.length > 4);
+  const merged = Array.from(new Set([...extracted, ...userTags.map((t) => t.toLowerCase())]));
+  return merged;
+}
+
+// ─── Tool registrations ───────────────────────────────────────────────────────
+
+// navigate
+toolRegistry.register({
+  name: 'navigate',
+  description:
+    'Navigate the browser to a URL. Use when you need to go to a specific page. Always wait for page load before taking further actions.',
+  category: 'navigation',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'The URL to navigate to' },
+    },
+    required: ['url'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const url = params['url'] as string;
+    return context.sendBridgeAction('navigate', { url });
+  },
+});
+
+// takeScreenshot
+toolRegistry.register({
+  name: 'takeScreenshot',
+  description:
+    'Take a screenshot of the current page. Use after every navigation and after every action to verify the result.',
+  category: 'observation',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+  async execute(_params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    return context.sendBridgeAction('screenshot', {});
+  },
+});
+
+// clickElement
+toolRegistry.register({
+  name: 'clickElement',
+  description:
+    'Click on an element described by text or coordinates. First take a screenshot to identify the element, then click. After clicking, take another screenshot to verify.',
+  category: 'interaction',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      description: {
+        type: 'string',
+        description: 'Text description of the element to click (e.g. button label, link text)',
+      },
+      x: {
+        type: 'number',
+        description: 'Optional X coordinate for the click',
+      },
+      y: {
+        type: 'number',
+        description: 'Optional Y coordinate for the click',
+      },
+    },
+    required: ['description'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { description, x, y } = params as { description: string; x?: number; y?: number };
+    return context.sendBridgeAction('click', { description, x, y });
+  },
+});
+
+// typeText
+toolRegistry.register({
+  name: 'typeText',
+  description:
+    "Type text into an input field. Identify the field by its label or placeholder text. Set clearFirst=true to clear existing content first.",
+  category: 'interaction',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      fieldDescription: {
+        type: 'string',
+        description: 'Label or placeholder text that identifies the input field',
+      },
+      text: { type: 'string', description: 'The text to type into the field' },
+      clearFirst: {
+        type: 'boolean',
+        description: 'Whether to clear existing content before typing (default: true)',
+      },
+    },
+    required: ['fieldDescription', 'text'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { fieldDescription, text, clearFirst } = params as {
+      fieldDescription: string;
+      text: string;
+      clearFirst?: boolean;
+    };
+    return context.sendBridgeAction('type', {
+      fieldDescription,
+      text,
+      clearFirst: clearFirst ?? true,
+    });
+  },
+});
+
+// selectOption
+toolRegistry.register({
+  name: 'selectOption',
+  description:
+    'Select an option from a dropdown menu. Identify the dropdown by its label and specify the option text to select.',
+  category: 'form',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      dropdownDescription: {
+        type: 'string',
+        description: 'Label or identifier for the dropdown element',
+      },
+      optionText: { type: 'string', description: 'The text of the option to select' },
+    },
+    required: ['dropdownDescription', 'optionText'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { dropdownDescription, optionText } = params as {
+      dropdownDescription: string;
+      optionText: string;
+    };
+    return context.sendBridgeAction('select', { dropdownDescription, optionText });
+  },
+});
+
+// pressKey
+toolRegistry.register({
+  name: 'pressKey',
+  description:
+    "Press a keyboard key. Use 'Enter' to submit forms, 'Tab' to move between fields, 'Escape' to close dialogs.",
+  category: 'interaction',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      key: {
+        type: 'string',
+        description: 'The key to press (e.g. "Enter", "Tab", "Escape")',
+      },
+    },
+    required: ['key'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { key } = params as { key: string };
+    return context.sendBridgeAction('pressKey', { key });
+  },
+});
+
+// scrollPage
+toolRegistry.register({
+  name: 'scrollPage',
+  description: 'Scroll the page up or down. Use when content is off-screen.',
+  category: 'navigation',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direction: {
+        type: 'string',
+        description: 'Direction to scroll',
+        enum: ['up', 'down'],
+      },
+      amount: {
+        type: 'number',
+        description: 'Number of pixels to scroll (default: 300)',
+      },
+    },
+    required: ['direction'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { direction, amount } = params as { direction: 'up' | 'down'; amount?: number };
+    return context.sendBridgeAction('scroll', { direction, amount: amount ?? 300 });
+  },
+});
+
+// addFormRow
+toolRegistry.register({
+  name: 'addFormRow',
+  description:
+    "Click the 'Add Row' or '+' button in a dynamic form to add a new entry. Use for DSR-type forms that need multiple task rows.",
+  category: 'form',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      buttonHint: {
+        type: 'string',
+        description: "Text or description of the add-row button (e.g. 'Add Row', '+')",
+      },
+    },
+    required: ['buttonHint'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { buttonHint } = params as { buttonHint: string };
+    const clickResult = await context.sendBridgeAction('click', { description: buttonHint });
+    if (!clickResult.success) {
+      return clickResult;
+    }
+    const screenshotResult = await context.sendBridgeAction('screenshot', {});
+    return screenshotResult;
+  },
+});
+
+// readMemory
+toolRegistry.register({
+  name: 'readMemory',
+  description:
+    'Search user memories for relevant preferences, facts, rules, and identity hints. ALWAYS call this at the start of every task to load relevant context. Pass the current URL as currentUrl for better results.',
+  category: 'memory',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query to find relevant memories' },
+      currentUrl: {
+        type: 'string',
+        description: 'Current page URL for site-specific memory filtering',
+      },
+    },
+    required: ['query'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { query, currentUrl } = params as { query: string; currentUrl?: string };
+
+    try {
+      const queryWords = query
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length > 0);
+
+      const itemsRef = db
+        .collection('memories')
+        .doc(context.userId)
+        .collection('items');
+      const snapshot = await itemsRef.get();
+
+      const scored: { memory: MemoryDocument; score: number }[] = snapshot.docs
+        .map((doc) => {
+          const mem = doc.data() as MemoryDocument;
+          if (!mem.id) mem.id = doc.id;
+          return { memory: mem, score: scoreMemory(mem, queryWords, currentUrl) };
+        })
+        .filter((item) => item.score >= 10)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5);
+
+      const memories = scored.map((s) => ({
+        id: s.memory.id,
+        content: s.memory.content,
+        type: s.memory.type,
+        sitePattern: s.memory.sitePattern,
+        score: s.score,
+      }));
+
+      return { success: true, data: { memories } };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+});
+
+// writeMemory
+toolRegistry.register({
+  name: 'writeMemory',
+  description:
+    "Save important information to memory. Call immediately when user says 'yaad rakhlo' or 'remember that' or provides a rule/preference. Duplicate content is automatically handled.",
+  category: 'memory',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      content: { type: 'string', description: 'The information to save to memory' },
+      type: {
+        type: 'string',
+        description: 'The type of memory',
+        enum: ['preference', 'fact', 'rule', 'identity_hint'],
+      },
+      sitePattern: {
+        type: 'string',
+        description: 'Optional site domain pattern this memory applies to (e.g. "github.com")',
+      },
+    },
+    required: ['content', 'type'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { content, type, sitePattern } = params as {
+      content: string;
+      type: 'preference' | 'fact' | 'rule' | 'identity_hint';
+      sitePattern?: string;
+    };
+
+    try {
+      const trimmedContent = content.trim();
+      const itemsRef = db
+        .collection('memories')
+        .doc(context.userId)
+        .collection('items');
+
+      // Duplicate detection (case-insensitive)
+      const snapshot = await itemsRef.get();
+      const duplicate = snapshot.docs.find(
+        (doc) =>
+          (doc.data() as MemoryDocument).content.toLowerCase() ===
+          trimmedContent.toLowerCase(),
+      );
+
+      const now = new Date().toISOString();
+
+      if (duplicate) {
+        const existing = duplicate.data() as MemoryDocument;
+        await duplicate.ref.update({
+          updatedAt: now,
+          lastUsed: now,
+          useCount: existing.useCount + 1,
+        });
+        return {
+          success: true,
+          data: { id: duplicate.id, updated: true, content: trimmedContent },
+        };
+      }
+
+      const autoTags = autoExtractTags(trimmedContent, []);
+      const docData: MemoryDocument = {
+        id: '',
+        userId: context.userId,
+        content: trimmedContent,
+        type,
+        sitePattern: sitePattern ?? undefined,
+        tags: autoTags,
+        useCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const docRef = await itemsRef.add(docData);
+      await docRef.update({ id: docRef.id });
+
+      return {
+        success: true,
+        data: { id: docRef.id, updated: false, content: trimmedContent },
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+});
+
+// getIdentity
+toolRegistry.register({
+  name: 'getIdentity',
+  description:
+    "Get saved login credentials by identity name (e.g. 'Jeel', 'Dev'). Returns username and password. Use when user says 'login as [name]' or when you need credentials for a site.",
+  category: 'identity',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: {
+        type: 'string',
+        description: 'The identity name to look up (case-insensitive)',
+      },
+    },
+    required: ['name'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { name } = params as { name: string };
+
+    try {
+      const itemsRef = db
+        .collection('identities')
+        .doc(context.userId)
+        .collection('items');
+      const snapshot = await itemsRef.where('deletedAt', '==', null).get();
+
+      const match = snapshot.docs.find(
+        (doc) =>
+          (doc.data() as IdentityDocument).name.toLowerCase() === name.toLowerCase(),
+      );
+
+      if (!match) {
+        return { success: false, error: `Identity '${name}' not found` };
+      }
+
+      const doc = match.data() as IdentityDocument;
+      const password = decrypt(doc.passwordEncrypted);
+
+      // Update lastUsed
+      await match.ref.update({ lastUsed: new Date().toISOString() });
+
+      return {
+        success: true,
+        data: {
+          id: match.id,
+          name: doc.name,
+          siteUrl: doc.siteUrl,
+          username: doc.username,
+          password,
+        },
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+});
+
+// getSitePrefs
+toolRegistry.register({
+  name: 'getSitePrefs',
+  description:
+    "Get default field values and override rules for the current site URL. Call this before filling any form to apply user's saved preferences automatically.",
+  category: 'form',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      url: {
+        type: 'string',
+        description: 'The current page URL to look up site preferences for',
+      },
+    },
+    required: ['url'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { url } = params as { url: string };
+
+    try {
+      const sitesRef = db
+        .collection('sitePreferences')
+        .doc(context.userId)
+        .collection('sites');
+      const snapshot = await sitesRef.get();
+
+      const prefs: SitePreferenceDocument[] = snapshot.docs.map((doc) => {
+        const data = doc.data() as SitePreferenceDocument;
+        if (!data.id) data.id = doc.id;
+        return data;
+      });
+
+      const normalizedUrl = url.trim().toLowerCase();
+
+      const matches = prefs.filter((pref) => {
+        const pattern = pref.sitePattern.toLowerCase();
+        return normalizedUrl.includes(pattern) || pattern.includes(normalizedUrl);
+      });
+
+      if (matches.length === 0) {
+        return { success: true, data: { prefs: null } };
+      }
+
+      // Pick the most specific match (longest sitePattern)
+      const best = matches.reduce((prev, curr) =>
+        curr.sitePattern.length > prev.sitePattern.length ? curr : prev,
+      );
+
+      return {
+        success: true,
+        data: {
+          prefs: {
+            id: best.id,
+            sitePattern: best.sitePattern,
+            defaults: best.defaults,
+            overrideRules: best.overrideRules,
+          },
+        },
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+});
+
+// sendProgress
+toolRegistry.register({
+  name: 'sendProgress',
+  description:
+    'Send a real-time progress message to the user. Use this to keep the user informed about what you are doing. Call frequently.',
+  category: 'communication',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      message: { type: 'string', description: 'The progress message to send to the user' },
+      status: {
+        type: 'string',
+        description: 'The status type of the message',
+        enum: ['info', 'success', 'error'],
+      },
+    },
+    required: ['message'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { message, status } = params as { message: string; status?: 'info' | 'success' | 'error' };
+    await context.sendProgress(status ?? 'info', message);
+    return { success: true, data: { sent: true } };
+  },
+});
+
+// askUserQuestion
+toolRegistry.register({
+  name: 'askUserQuestion',
+  description:
+    'Ask the user a question when you need clarification. Use when the command is genuinely ambiguous. Provide options when possible to make it easier to respond.',
+  category: 'communication',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      question: { type: 'string', description: 'The question to ask the user' },
+      options: {
+        type: 'string',
+        description: 'Optional comma-separated list of answer options',
+      },
+    },
+    required: ['question'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { question, options } = params as { question: string; options?: string };
+    const optionsArray = options
+      ? options
+          .split(',')
+          .map((o) => o.trim())
+          .filter((o) => o.length > 0)
+      : undefined;
+
+    await context.sendProgress(
+      'asking',
+      JSON.stringify({ question, options: optionsArray }),
+    );
+
+    return {
+      success: true,
+      data: {
+        asked: true,
+        question,
+        note: 'Question sent to user. Continue after user responds.',
+      },
+    };
+  },
+});
+
+// taskComplete
+toolRegistry.register({
+  name: 'taskComplete',
+  description:
+    'Call this when the task is fully complete. Provide a clear summary of what was accomplished.',
+  category: 'workflow',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      summary: {
+        type: 'string',
+        description: 'A clear summary of what was accomplished',
+      },
+    },
+    required: ['summary'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const { summary } = params as { summary: string };
+    await context.sendProgress('complete', summary);
+    return { success: true, data: { completed: true, summary } };
+  },
+});
+
+// Suppress unused import warning — randomUUID is used for future tooling needs
+void randomUUID;
