@@ -70,4 +70,39 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.send({ success: true });
     },
   );
+
+  // PUT /settings — update user settings
+  fastify.put<{ Body: Partial<UserSettings> }>(
+    '/settings',
+    { preHandler: authMiddleware },
+    async (request, reply) => {
+      const { uid } = request.user;
+      const body = request.body;
+
+      const profileRef = db.collection('users').doc(uid).collection('profile').doc('data');
+      const profileSnap = await profileRef.get();
+
+      if (!profileSnap.exists) {
+        return reply.status(404).send({ success: false, error: 'Profile not found' });
+      }
+
+      const profile = profileSnap.data() as UserProfile;
+      const validThemes = ['dark', 'light', 'system'] as const;
+      const validFontSizes = ['small', 'medium', 'large'] as const;
+      const validLanguages = ['english', 'hinglish', 'hindi'] as const;
+
+      const updates: Partial<UserSettings> = {};
+      if (body.theme !== undefined && (validThemes as readonly string[]).includes(body.theme)) updates.theme = body.theme;
+      if (body.fontSize !== undefined && (validFontSizes as readonly string[]).includes(body.fontSize)) updates.fontSize = body.fontSize;
+      if (body.language !== undefined && (validLanguages as readonly string[]).includes(body.language)) updates.language = body.language;
+      if (body.autoScreenshot !== undefined) updates.autoScreenshot = Boolean(body.autoScreenshot);
+      if (body.askBeforeSubmit !== undefined) updates.askBeforeSubmit = Boolean(body.askBeforeSubmit);
+      if (body.progressNotifications !== undefined) updates.progressNotifications = Boolean(body.progressNotifications);
+
+      const newSettings = { ...profile.settings, ...updates };
+      await profileRef.update({ settings: newSettings });
+
+      return reply.send({ success: true, data: { ...profile, settings: newSettings } });
+    },
+  );
 }
