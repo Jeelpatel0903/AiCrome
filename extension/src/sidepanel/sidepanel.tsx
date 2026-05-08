@@ -8,7 +8,7 @@ import {
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
-import type { IdentityPublic } from '../../../shared/src/types';
+import type { IdentityPublic, Memory, MemoryType } from '../../../shared/src/types';
 
 type Tab = 'agent' | 'memory' | 'vault' | 'flows' | 'schedule';
 
@@ -231,6 +231,747 @@ function LoginScreen() {
         >
           {error}
         </p>
+      )}
+    </div>
+  );
+}
+
+// ==================== MEMORY TAB ====================
+
+const MEMORY_TYPE_ICONS: Record<MemoryType, string> = {
+  preference: '🎯',
+  fact: '📌',
+  rule: '⚡',
+  identity_hint: '👤',
+};
+
+const MEMORY_TYPE_LABELS: Record<MemoryType, string> = {
+  preference: 'Preferences',
+  fact: 'Facts',
+  rule: 'Rules',
+  identity_hint: 'Identity Hints',
+};
+
+type MemoryFilterType = 'all' | MemoryType;
+type AddMode = 'natural' | 'manual';
+
+interface MemoryTabProps {
+  token: string;
+}
+
+function detectTypeFromContent(content: string): MemoryType {
+  const lower = content.toLowerCase();
+  if (lower.includes('agar') || lower.includes('if') || lower.includes('jab')) return 'rule';
+  if (
+    lower.includes('hamesha') ||
+    lower.includes('always') ||
+    lower.includes('default') ||
+    lower.includes('hota hai')
+  )
+    return 'preference';
+  return 'fact';
+}
+
+function formatMemoryAge(lastUsed?: string): string {
+  if (!lastUsed) return 'Never used';
+  const diff = Date.now() - new Date(lastUsed).getTime();
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+  if (days === 0) return 'Today';
+  if (days === 1) return '1 day ago';
+  if (days < 30) return `${days} days ago`;
+  const months = Math.floor(days / 30);
+  return `${months} month${months > 1 ? 's' : ''} ago`;
+}
+
+function MemoryTab({ token }: MemoryTabProps) {
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterType, setFilterType] = useState<MemoryFilterType>('all');
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [addMode, setAddMode] = useState<AddMode>('natural');
+  const [naturalContent, setNaturalContent] = useState('');
+  const [manualContent, setManualContent] = useState('');
+  const [manualType, setManualType] = useState<MemoryType>('fact');
+  const [manualSitePattern, setManualSitePattern] = useState('');
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formLoading, setFormLoading] = useState(false);
+  const [editingMemory, setEditingMemory] = useState<Memory | null>(null);
+  const [editContent, setEditContent] = useState('');
+  const [editSitePattern, setEditSitePattern] = useState('');
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editLoading, setEditLoading] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
+  const fetchMemories = async () => {
+    setLoading(true);
+    setFetchError(null);
+    try {
+      const res = await fetch(`${backendUrl}/memory/all?pageSize=100`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const json = (await res.json()) as {
+        success: boolean;
+        data?: Memory[];
+        error?: string;
+      };
+      if (!json.success) throw new Error(json.error ?? 'Failed to fetch memories');
+      setMemories(json.data ?? []);
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setFetchError(e.message ?? 'Failed to load memories');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchMemories();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const filteredMemories = memories.filter((m) => {
+    const matchesType = filterType === 'all' || m.type === filterType;
+    const matchesSearch =
+      !searchQuery ||
+      m.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      m.tags.some((t) => t.toLowerCase().includes(searchQuery.toLowerCase()));
+    return matchesType && matchesSearch;
+  });
+
+  const resetAddForm = () => {
+    setNaturalContent('');
+    setManualContent('');
+    setManualType('fact');
+    setManualSitePattern('');
+    setFormError(null);
+    setShowAddForm(false);
+  };
+
+  const handleAddMemory = async () => {
+    setFormError(null);
+    let content: string;
+    let type: MemoryType;
+    let sitePattern: string | undefined;
+
+    if (addMode === 'natural') {
+      if (!naturalContent.trim()) {
+        setFormError('Content is required');
+        return;
+      }
+      content = naturalContent.trim();
+      type = detectTypeFromContent(content);
+      sitePattern = undefined;
+    } else {
+      if (!manualContent.trim()) {
+        setFormError('Content is required');
+        return;
+      }
+      content = manualContent.trim();
+      type = manualType;
+      sitePattern = manualSitePattern.trim() || undefined;
+    }
+
+    setFormLoading(true);
+    try {
+      const res = await fetch(`${backendUrl}/memory`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ content, type, sitePattern }),
+      });
+      const json = (await res.json()) as { success: boolean; error?: string };
+      if (!json.success) throw new Error(json.error ?? 'Save failed');
+      resetAddForm();
+      await fetchMemories();
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setFormError(e.message ?? 'Save failed');
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+  const openEdit = (memory: Memory) => {
+    setEditingMemory(memory);
+    setEditContent(memory.content);
+    setEditSitePattern(memory.sitePattern ?? '');
+    setEditError(null);
+  };
+
+  const handleEditSave = async () => {
+    if (!editingMemory) return;
+    if (!editContent.trim()) {
+      setEditError('Content is required');
+      return;
+    }
+    setEditLoading(true);
+    setEditError(null);
+    try {
+      const body: { content: string; sitePattern?: string } = { content: editContent.trim() };
+      if (editSitePattern.trim()) body.sitePattern = editSitePattern.trim();
+      const res = await fetch(`${backendUrl}/memory/${editingMemory.id}`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      const json = (await res.json()) as { success: boolean; error?: string };
+      if (!json.success) throw new Error(json.error ?? 'Update failed');
+      setEditingMemory(null);
+      await fetchMemories();
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setEditError(e.message ?? 'Update failed');
+    } finally {
+      setEditLoading(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      const res = await fetch(`${backendUrl}/memory/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const json = (await res.json()) as { success: boolean; error?: string };
+      if (!json.success) throw new Error(json.error ?? 'Delete failed');
+      setDeleteConfirmId(null);
+      await fetchMemories();
+    } catch {
+      // Silently sync
+      await fetchMemories();
+    }
+  };
+
+  if (loading) {
+    return (
+      <div style={{ textAlign: 'center', color: '#475569', marginTop: '60px' }}>
+        <div
+          style={{
+            width: '32px',
+            height: '32px',
+            border: '3px solid #334155',
+            borderTop: '3px solid #6366f1',
+            borderRadius: '50%',
+            margin: '0 auto 12px',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+        <p>Loading memories...</p>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  if (fetchError) {
+    return (
+      <div style={{ textAlign: 'center', color: '#f87171', marginTop: '40px', padding: '16px' }}>
+        <div style={{ fontSize: '32px', marginBottom: '8px' }}>⚠️</div>
+        <p style={{ fontSize: '13px' }}>{fetchError}</p>
+        <button
+          onClick={() => void fetchMemories()}
+          style={{
+            marginTop: '12px',
+            background: '#6366f1',
+            border: 'none',
+            borderRadius: '6px',
+            padding: '8px 16px',
+            color: 'white',
+            cursor: 'pointer',
+            fontSize: '13px',
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const filterButtons: { id: MemoryFilterType; label: string }[] = [
+    { id: 'all', label: 'All' },
+    { id: 'preference', label: 'Preferences' },
+    { id: 'fact', label: 'Facts' },
+    { id: 'rule', label: 'Rules' },
+    { id: 'identity_hint', label: 'Identity Hints' },
+  ];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      {/* Search bar */}
+      <input
+        type="text"
+        placeholder="Search memories..."
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+        style={{
+          background: '#1e293b',
+          border: '1px solid #334155',
+          borderRadius: '8px',
+          padding: '8px 12px',
+          color: '#e2e8f0',
+          fontSize: '13px',
+          outline: 'none',
+          width: '100%',
+          boxSizing: 'border-box',
+        }}
+      />
+
+      {/* Filter row */}
+      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+        {filterButtons.map((btn) => (
+          <button
+            key={btn.id}
+            onClick={() => setFilterType(btn.id)}
+            style={{
+              background: filterType === btn.id ? '#6366f1' : 'transparent',
+              border: `1px solid ${filterType === btn.id ? '#6366f1' : '#334155'}`,
+              borderRadius: '16px',
+              padding: '4px 10px',
+              color: filterType === btn.id ? 'white' : '#64748b',
+              cursor: 'pointer',
+              fontSize: '11px',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {btn.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Memory Cards */}
+      {filteredMemories.length === 0 && !showAddForm ? (
+        <div style={{ textAlign: 'center', color: '#475569', marginTop: '32px' }}>
+          <div style={{ fontSize: '48px', marginBottom: '12px' }}>🧠</div>
+          <p style={{ fontSize: '14px' }}>
+            {searchQuery || filterType !== 'all'
+              ? 'No memories match your filter.'
+              : 'AI is learning your preferences. Start using DevFlow!'}
+          </p>
+        </div>
+      ) : (
+        filteredMemories.map((memory) => (
+          <div
+            key={memory.id}
+            style={{
+              background: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '10px',
+              padding: '12px',
+            }}
+          >
+            {editingMemory?.id === memory.id ? (
+              /* Inline edit form */
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <textarea
+                  value={editContent}
+                  onChange={(e) => setEditContent(e.target.value)}
+                  rows={3}
+                  style={{
+                    background: '#0f172a',
+                    border: '1px solid #334155',
+                    borderRadius: '6px',
+                    padding: '8px',
+                    color: '#e2e8f0',
+                    fontSize: '12px',
+                    resize: 'none',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+                <input
+                  type="text"
+                  placeholder="Site pattern (optional)"
+                  value={editSitePattern}
+                  onChange={(e) => setEditSitePattern(e.target.value)}
+                  style={{
+                    background: '#0f172a',
+                    border: '1px solid #334155',
+                    borderRadius: '6px',
+                    padding: '6px 8px',
+                    color: '#e2e8f0',
+                    fontSize: '12px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+                {editError && (
+                  <p style={{ color: '#f87171', fontSize: '11px', margin: 0 }}>{editError}</p>
+                )}
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button
+                    onClick={() => void handleEditSave()}
+                    disabled={editLoading}
+                    style={{
+                      flex: 1,
+                      background: '#6366f1',
+                      border: 'none',
+                      borderRadius: '6px',
+                      padding: '6px',
+                      color: 'white',
+                      cursor: editLoading ? 'not-allowed' : 'pointer',
+                      fontSize: '12px',
+                      opacity: editLoading ? 0.7 : 1,
+                    }}
+                  >
+                    {editLoading ? 'Saving...' : 'Save'}
+                  </button>
+                  <button
+                    onClick={() => setEditingMemory(null)}
+                    style={{
+                      flex: 1,
+                      background: 'transparent',
+                      border: '1px solid #334155',
+                      borderRadius: '6px',
+                      padding: '6px',
+                      color: '#94a3b8',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* Memory card view */
+              <>
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px' }}>
+                  <span style={{ fontSize: '18px', flexShrink: 0, marginTop: '1px' }}>
+                    {MEMORY_TYPE_ICONS[memory.type]}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: '12px',
+                        color: '#e2e8f0',
+                        lineHeight: 1.4,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {memory.content}
+                    </p>
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        marginTop: '6px',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      {memory.sitePattern && (
+                        <span
+                          style={{
+                            background: '#1e293b',
+                            border: '1px solid #334155',
+                            borderRadius: '10px',
+                            padding: '1px 7px',
+                            fontSize: '10px',
+                            color: '#94a3b8',
+                          }}
+                        >
+                          {memory.sitePattern}
+                        </span>
+                      )}
+                      <span style={{ fontSize: '10px', color: '#475569' }}>
+                        {formatMemoryAge(memory.lastUsed)}
+                      </span>
+                      <span
+                        style={{
+                          marginLeft: 'auto',
+                          fontSize: '10px',
+                          color: '#475569',
+                          textTransform: 'capitalize',
+                        }}
+                      >
+                        {MEMORY_TYPE_LABELS[memory.type]}
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                    <button
+                      onClick={() => openEdit(memory)}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        cursor: 'pointer',
+                        fontSize: '13px',
+                        padding: '3px',
+                        color: '#94a3b8',
+                      }}
+                      title="Edit"
+                    >
+                      ✏️
+                    </button>
+                    <button
+                      onClick={() => setDeleteConfirmId(memory.id)}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        cursor: 'pointer',
+                        fontSize: '13px',
+                        padding: '3px',
+                        color: '#94a3b8',
+                      }}
+                      title="Delete"
+                    >
+                      🗑️
+                    </button>
+                  </div>
+                </div>
+
+                {/* Delete confirmation */}
+                {deleteConfirmId === memory.id && (
+                  <div
+                    style={{
+                      marginTop: '10px',
+                      padding: '10px',
+                      background: '#0f172a',
+                      borderRadius: '8px',
+                      border: '1px solid #ef4444',
+                    }}
+                  >
+                    <p style={{ margin: '0 0 8px 0', fontSize: '12px', color: '#fca5a5' }}>
+                      Delete this memory? This cannot be undone.
+                    </p>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        onClick={() => void handleDelete(memory.id)}
+                        style={{
+                          background: '#ef4444',
+                          border: 'none',
+                          borderRadius: '6px',
+                          padding: '6px 12px',
+                          color: 'white',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                        }}
+                      >
+                        Delete
+                      </button>
+                      <button
+                        onClick={() => setDeleteConfirmId(null)}
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid #334155',
+                          borderRadius: '6px',
+                          padding: '6px 12px',
+                          color: '#94a3b8',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ))
+      )}
+
+      {/* Add Memory button / form */}
+      {!showAddForm ? (
+        <button
+          onClick={() => setShowAddForm(true)}
+          style={{
+            background: '#6366f1',
+            border: 'none',
+            borderRadius: '8px',
+            padding: '10px',
+            color: 'white',
+            cursor: 'pointer',
+            fontSize: '13px',
+            fontWeight: '600',
+            width: '100%',
+            marginTop: '4px',
+          }}
+        >
+          + Add Memory
+        </button>
+      ) : (
+        <div
+          style={{
+            background: '#1e293b',
+            border: '1px solid #334155',
+            borderRadius: '12px',
+            padding: '14px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '10px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <h3 style={{ margin: 0, color: '#e2e8f0', fontSize: '13px', fontWeight: '600' }}>
+              Add Memory
+            </h3>
+            {/* Mode toggle */}
+            <div style={{ display: 'flex', gap: '4px' }}>
+              <button
+                onClick={() => setAddMode('natural')}
+                style={{
+                  background: addMode === 'natural' ? '#6366f1' : 'transparent',
+                  border: `1px solid ${addMode === 'natural' ? '#6366f1' : '#334155'}`,
+                  borderRadius: '6px',
+                  padding: '3px 8px',
+                  color: addMode === 'natural' ? 'white' : '#64748b',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                }}
+              >
+                Natural
+              </button>
+              <button
+                onClick={() => setAddMode('manual')}
+                style={{
+                  background: addMode === 'manual' ? '#6366f1' : 'transparent',
+                  border: `1px solid ${addMode === 'manual' ? '#6366f1' : '#334155'}`,
+                  borderRadius: '6px',
+                  padding: '3px 8px',
+                  color: addMode === 'manual' ? 'white' : '#64748b',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                }}
+              >
+                Manual
+              </button>
+            </div>
+          </div>
+
+          {addMode === 'natural' ? (
+            <textarea
+              value={naturalContent}
+              onChange={(e) => setNaturalContent(e.target.value)}
+              placeholder="Yaad rakhlo ke..."
+              rows={3}
+              style={{
+                background: '#0f172a',
+                border: '1px solid #334155',
+                borderRadius: '8px',
+                padding: '10px',
+                color: '#e2e8f0',
+                fontSize: '13px',
+                resize: 'none',
+                outline: 'none',
+                width: '100%',
+                boxSizing: 'border-box',
+              }}
+            />
+          ) : (
+            <>
+              <select
+                value={manualType}
+                onChange={(e) => setManualType(e.target.value as MemoryType)}
+                style={{
+                  background: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: '8px',
+                  padding: '8px 10px',
+                  color: '#e2e8f0',
+                  fontSize: '13px',
+                  outline: 'none',
+                  width: '100%',
+                  boxSizing: 'border-box',
+                }}
+              >
+                <option value="preference">🎯 Preference</option>
+                <option value="fact">📌 Fact</option>
+                <option value="rule">⚡ Rule</option>
+                <option value="identity_hint">👤 Identity Hint</option>
+              </select>
+              <textarea
+                value={manualContent}
+                onChange={(e) => setManualContent(e.target.value)}
+                placeholder="Memory content..."
+                rows={3}
+                style={{
+                  background: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: '8px',
+                  padding: '10px',
+                  color: '#e2e8f0',
+                  fontSize: '13px',
+                  resize: 'none',
+                  outline: 'none',
+                  width: '100%',
+                  boxSizing: 'border-box',
+                }}
+              />
+              <input
+                type="text"
+                placeholder="Site pattern (optional, e.g. hrportal.com)"
+                value={manualSitePattern}
+                onChange={(e) => setManualSitePattern(e.target.value)}
+                style={{
+                  background: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: '8px',
+                  padding: '8px 10px',
+                  color: '#e2e8f0',
+                  fontSize: '13px',
+                  outline: 'none',
+                  width: '100%',
+                  boxSizing: 'border-box',
+                }}
+              />
+            </>
+          )}
+
+          {formError && (
+            <p style={{ color: '#f87171', fontSize: '12px', margin: 0 }}>{formError}</p>
+          )}
+
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              onClick={() => void handleAddMemory()}
+              disabled={formLoading}
+              style={{
+                flex: 1,
+                background: '#6366f1',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '10px',
+                color: 'white',
+                cursor: formLoading ? 'not-allowed' : 'pointer',
+                fontSize: '13px',
+                fontWeight: '600',
+                opacity: formLoading ? 0.7 : 1,
+              }}
+            >
+              {formLoading ? 'Saving...' : 'Save'}
+            </button>
+            <button
+              onClick={resetAddForm}
+              disabled={formLoading}
+              style={{
+                flex: 1,
+                background: 'transparent',
+                border: '1px solid #334155',
+                borderRadius: '8px',
+                padding: '10px',
+                color: '#94a3b8',
+                cursor: 'pointer',
+                fontSize: '13px',
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -930,13 +1671,7 @@ function SidePanel() {
             )}
           </div>
         )}
-        {activeTab === 'memory' && (
-          <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
-            <div style={{ fontSize: '48px', marginBottom: '12px' }}>🧠</div>
-            <p>AI is learning your preferences.</p>
-            <p style={{ fontSize: '13px', marginTop: '8px' }}>Start using DevFlow!</p>
-          </div>
-        )}
+        {activeTab === 'memory' && token && <MemoryTab token={token} />}
         {activeTab === 'vault' && token && <VaultTab token={token} />}
         {activeTab === 'flows' && (
           <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
