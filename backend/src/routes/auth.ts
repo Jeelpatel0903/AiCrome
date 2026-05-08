@@ -29,9 +29,9 @@ const DEFAULT_SETTINGS: UserSettings = {
 };
 
 export async function authRoutes(fastify: FastifyInstance): Promise<void> {
-  // GET /auth/me — verify token, fetch or create user profile from Firestore
+  // GET /me — verify token, fetch or create user profile from Firestore
   fastify.get(
-    '/auth/me',
+    '/me',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid } = request.user;
@@ -62,9 +62,9 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // POST /auth/logout — clear session (token revocation handled client-side)
+  // POST /logout — clear session (token revocation handled client-side)
   fastify.post(
-    '/auth/logout',
+    '/logout',
     { preHandler: authMiddleware },
     async (_request, reply) => {
       return reply.send({ success: true });

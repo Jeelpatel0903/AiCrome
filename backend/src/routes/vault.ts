@@ -62,9 +62,9 @@ function isValidUrl(url: string): boolean {
 }
 
 export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
-  // POST /vault/identity — create a new identity
+  // POST /identity — create a new identity
   fastify.post<{ Body: IdentityCreateBody }>(
-    '/vault/identity',
+    '/identity',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
@@ -121,9 +121,9 @@ export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // GET /vault/identities — list all identities for user
+  // GET /identities — list all identities for user
   fastify.get(
-    '/vault/identities',
+    '/identities',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
@@ -139,9 +139,9 @@ export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // GET /vault/identity/by-name/:name — find identity by name (case-insensitive, returns decrypted password)
+  // GET /identity/by-name/:name — find identity by name (case-insensitive, returns decrypted password)
   fastify.get<{ Params: { name: string } }>(
-    '/vault/identity/by-name/:name',
+    '/identity/by-name/:name',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
@@ -171,9 +171,9 @@ export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // GET /vault/identity/by-site — find identities by site URL
+  // GET /identity/by-site — find identities by site URL
   fastify.get<{ Querystring: { url?: string } }>(
-    '/vault/identity/by-site',
+    '/identity/by-site',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
@@ -199,9 +199,9 @@ export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // PUT /vault/identity/:id — update an identity
+  // PUT /identity/:id — update an identity
   fastify.put<{ Params: { id: string }; Body: IdentityUpdateBody }>(
-    '/vault/identity/:id',
+    '/identity/:id',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
@@ -251,9 +251,9 @@ export async function vaultRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
-  // DELETE /vault/identity/:id — soft delete an identity
+  // DELETE /identity/:id — soft delete an identity
   fastify.delete<{ Params: { id: string } }>(
-    '/vault/identity/:id',
+    '/identity/:id',
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
