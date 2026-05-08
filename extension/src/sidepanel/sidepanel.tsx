@@ -1536,6 +1536,14 @@ interface ProgressUpdateMsg {
   timestamp?: string;
 }
 
+interface SessionEntry {
+  sessionId: string;
+  command: string;
+  messages: ProgressMessage[];
+  status: 'running' | 'complete' | 'error';
+  startedAt: string;
+}
+
 interface AgentTabProps {
   token: string;
 }
@@ -1583,33 +1591,104 @@ function getCurrentUrl(): Promise<string> {
 }
 
 function AgentTab({ token }: AgentTabProps) {
-  const [messages, setMessages] = useState<ProgressMessage[]>([]);
+  const [sessions, setSessions] = useState<SessionEntry[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [command, setCommand] = useState('');
   const [isRunning, setIsRunning] = useState(false);
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [showPrevSessions, setShowPrevSessions] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Voice input toggle
+  const toggleVoice = () => {
+    type SpeechRecCtor = new () => {
+      continuous: boolean;
+      interimResults: boolean;
+      lang: string;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      onresult: ((event: any) => void) | null;
+      onend: (() => void) | null;
+      onerror: (() => void) | null;
+      start(): void;
+      stop(): void;
+    };
+    const winAny = window as Window & {
+      SpeechRecognition?: SpeechRecCtor;
+      webkitSpeechRecognition?: SpeechRecCtor;
+    };
+    const SpeechRec = winAny.SpeechRecognition ?? winAny.webkitSpeechRecognition;
+
+    if (!SpeechRec) {
+      alert('Voice input not supported in this browser');
+      return;
+    }
+
+    if (isListening) {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRec();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-US';
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recognition.onresult = (event: any) => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+      const transcript: string = event.results[0][0].transcript;
+      setCommand((prev) => (prev ? prev + ' ' + transcript : transcript));
+    };
+
+    recognition.onend = () => setIsListening(false);
+    recognition.onerror = () => setIsListening(false);
+
+    recognitionRef.current = recognition;
+    recognition.start();
+    setIsListening(true);
+  };
+
+  // Active session messages
+  const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
+  const activeMessages = activeSession?.messages ?? [];
 
   // Subscribe to progress updates from background script
   useEffect(() => {
     const listener = (msg: ProgressUpdateMsg) => {
       if (msg.type === 'progress_update') {
-        // Skip bridge_request messages from the feed
         const msgType = msg.type_ || 'message';
         if (msgType === 'bridge_request') return;
 
-        setMessages((prev) => [
-          ...prev,
-          {
-            type: msgType,
-            message: msg.message || '',
-            timestamp: msg.timestamp || new Date().toISOString(),
-          },
-        ]);
+        const newMsg: ProgressMessage = {
+          type: msgType,
+          message: msg.message || '',
+          timestamp: msg.timestamp || new Date().toISOString(),
+        };
+
+        setSessions((prev) =>
+          prev.map((s) => {
+            // Match by sessionId from msg, or update the running session
+            if (
+              (msg.sessionId && s.sessionId === msg.sessionId) ||
+              (!msg.sessionId && s.status === 'running')
+            ) {
+              const newStatus =
+                msgType === 'complete' ? 'complete' : msgType === 'error' ? 'error' : s.status;
+              return { ...s, messages: [...s.messages, newMsg], status: newStatus };
+            }
+            return s;
+          }),
+        );
 
         if (msgType === 'complete' || msgType === 'error') {
           setIsRunning(false);
-          setSessionId(null);
+          setCurrentSessionId(null);
         }
       }
     };
@@ -1620,7 +1699,7 @@ function AgentTab({ token }: AgentTabProps) {
   // Auto-scroll to bottom on new message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [activeMessages]);
 
   const handleSend = async () => {
     if (!command.trim() || isRunning) return;
@@ -1630,6 +1709,18 @@ function AgentTab({ token }: AgentTabProps) {
     setIsRunning(true);
 
     const currentUrl = await getCurrentUrl();
+
+    // Create new session entry
+    const tempId = 'session-' + Date.now().toString(36);
+    const newSession: SessionEntry = {
+      sessionId: tempId,
+      command: cmd,
+      messages: [{ type: 'user', message: cmd, timestamp: new Date().toISOString() }],
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    };
+    setSessions((prev) => [...prev, newSession]);
+    setActiveSessionId(tempId);
 
     try {
       const res = await fetch(`${backendUrl}/agent/run`, {
@@ -1649,31 +1740,32 @@ function AgentTab({ token }: AgentTabProps) {
         throw new Error(json.error ?? 'Failed to start agent');
       }
       if (json.sessionId) {
-        setSessionId(json.sessionId);
+        // Update temp session ID with real session ID
+        setSessions((prev) =>
+          prev.map((s) => (s.sessionId === tempId ? { ...s, sessionId: json.sessionId! } : s)),
+        );
+        setActiveSessionId(json.sessionId);
+        setCurrentSessionId(json.sessionId);
+      } else {
+        setCurrentSessionId(tempId);
       }
-      // Add user command to feed
-      setMessages((prev) => [
-        ...prev,
-        {
-          type: 'user',
-          message: cmd,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
     } catch (err: unknown) {
       const e = err as { message?: string };
       setRunError(e.message ?? 'Failed to start agent');
       setIsRunning(false);
+      setSessions((prev) =>
+        prev.map((s) => (s.sessionId === tempId ? { ...s, status: 'error' } : s)),
+      );
     }
   };
 
   const handleCancel = async () => {
-    if (!sessionId) {
+    if (!currentSessionId) {
       setIsRunning(false);
       return;
     }
     try {
-      await fetch(`${backendUrl}/agent/cancel/${sessionId}`, {
+      await fetch(`${backendUrl}/agent/cancel/${currentSessionId}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -1681,18 +1773,23 @@ function AgentTab({ token }: AgentTabProps) {
       // Ignore cancel errors
     } finally {
       setIsRunning(false);
-      setSessionId(null);
+      setCurrentSessionId(null);
     }
   };
 
-  const handleClear = () => {
-    setMessages([]);
-    setRunError(null);
+  const handleClearCompleted = () => {
+    setSessions((prev) => prev.filter((s) => s.status === 'running'));
   };
+
+  const completedSessions = sessions.filter(
+    (s) => (s.status === 'complete' || s.status === 'error') && s.sessionId !== activeSessionId,
+  );
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* Header row with Clear button */}
+      <style>{`@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }`}</style>
+
+      {/* Header row */}
       <div
         style={{
           display: 'flex',
@@ -1704,9 +1801,13 @@ function AgentTab({ token }: AgentTabProps) {
         <span style={{ fontSize: '12px', color: '#475569' }}>
           {isRunning ? 'Agent is running...' : 'Agent ready'}
         </span>
-        {messages.length > 0 && (
+        {sessions.length > 0 && (
           <button
-            onClick={handleClear}
+            onClick={() => {
+              setSessions([]);
+              setActiveSessionId(null);
+              setRunError(null);
+            }}
             style={{
               background: 'transparent',
               border: '1px solid #334155',
@@ -1717,10 +1818,48 @@ function AgentTab({ token }: AgentTabProps) {
               fontSize: '11px',
             }}
           >
-            Clear
+            Clear All
           </button>
         )}
       </div>
+
+      {/* Sessions tabs (when multiple) */}
+      {sessions.length > 1 && (
+        <div
+          style={{
+            display: 'flex',
+            gap: '4px',
+            overflowX: 'auto',
+            marginBottom: '8px',
+            paddingBottom: '2px',
+          }}
+        >
+          {sessions.map((s) => (
+            <button
+              key={s.sessionId}
+              onClick={() => setActiveSessionId(s.sessionId)}
+              style={{
+                background: activeSessionId === s.sessionId ? '#1e293b' : 'transparent',
+                border: `1px solid ${activeSessionId === s.sessionId ? '#6366f1' : '#334155'}`,
+                borderRadius: '6px',
+                padding: '3px 8px',
+                color: activeSessionId === s.sessionId ? '#e2e8f0' : '#64748b',
+                cursor: 'pointer',
+                fontSize: '11px',
+                whiteSpace: 'nowrap',
+                maxWidth: '120px',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                flexShrink: 0,
+              }}
+              title={s.command}
+            >
+              {s.status === 'running' ? '⏳' : s.status === 'complete' ? '✅' : '❌'}{' '}
+              {s.command.length > 15 ? s.command.slice(0, 15) + '…' : s.command}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Messages feed */}
       <div
@@ -1733,7 +1872,7 @@ function AgentTab({ token }: AgentTabProps) {
           minHeight: 0,
         }}
       >
-        {messages.length === 0 ? (
+        {activeMessages.length === 0 ? (
           <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
             <div style={{ fontSize: '48px', marginBottom: '12px' }}>🤖</div>
             <p style={{ fontSize: '15px', marginBottom: '8px' }}>Welcome to DevFlow AI</p>
@@ -1742,7 +1881,7 @@ function AgentTab({ token }: AgentTabProps) {
             </p>
           </div>
         ) : (
-          messages.map((msg, i) => {
+          activeMessages.map((msg, i) => {
             if (msg.type === 'user') {
               return (
                 <div
@@ -1783,6 +1922,93 @@ function AgentTab({ token }: AgentTabProps) {
 
       {runError && (
         <p style={{ color: '#f87171', fontSize: '12px', margin: '6px 0 0 0' }}>{runError}</p>
+      )}
+
+      {/* Previous sessions collapsed panel */}
+      {completedSessions.length > 0 && (
+        <div
+          style={{
+            marginTop: '8px',
+            border: '1px solid #334155',
+            borderRadius: '6px',
+            overflow: 'hidden',
+          }}
+        >
+          <button
+            onClick={() => setShowPrevSessions((v) => !v)}
+            style={{
+              width: '100%',
+              background: '#1e293b',
+              border: 'none',
+              padding: '6px 10px',
+              color: '#94a3b8',
+              fontSize: '11px',
+              cursor: 'pointer',
+              textAlign: 'left',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}
+          >
+            <span>
+              {showPrevSessions ? '▲' : '▼'} Previous Sessions ({completedSessions.length})
+            </span>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                handleClearCompleted();
+              }}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#64748b',
+                fontSize: '10px',
+                cursor: 'pointer',
+                padding: '0',
+              }}
+            >
+              Clear completed
+            </button>
+          </button>
+          {showPrevSessions && (
+            <div style={{ padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              {completedSessions.map((s) => (
+                <button
+                  key={s.sessionId}
+                  onClick={() => setActiveSessionId(s.sessionId)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    padding: '4px 6px',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                  }}
+                >
+                  <span>{s.status === 'complete' ? '✅' : '❌'}</span>
+                  <span
+                    style={{
+                      flex: 1,
+                      color: '#94a3b8',
+                      fontSize: '12px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {s.command}
+                  </span>
+                  <span style={{ color: '#475569', fontSize: '10px', flexShrink: 0 }}>
+                    {formatTimeAgo(s.startedAt)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Input + Cancel */}
@@ -1834,6 +2060,23 @@ function AgentTab({ token }: AgentTabProps) {
             rows={1}
           />
           <button
+            onClick={toggleVoice}
+            title={isListening ? 'Stop listening' : 'Voice input'}
+            style={{
+              background: isListening ? '#ef4444' : '#1e293b',
+              border: '1px solid ' + (isListening ? '#ef4444' : '#334155'),
+              borderRadius: '6px',
+              padding: '8px 10px',
+              cursor: 'pointer',
+              fontSize: '16px',
+              color: isListening ? 'white' : '#64748b',
+              flexShrink: 0,
+              animation: isListening ? 'pulse 1s ease-in-out infinite' : 'none',
+            }}
+          >
+            🎙️
+          </button>
+          <button
             onClick={() => void handleSend()}
             disabled={isRunning || !command.trim()}
             style={{
@@ -1861,6 +2104,7 @@ function AgentTab({ token }: AgentTabProps) {
 interface WorkflowStep {
   id: string;
   command: string;
+  condition?: string; // if set, only run step if condition is truthy in agent context
 }
 
 interface WorkflowDocument {
@@ -1904,6 +2148,10 @@ function FlowsTab({ token }: FlowsTabProps) {
   const [runningId, setRunningId] = useState<string | null>(null);
   const [runStepIndex, setRunStepIndex] = useState<number>(-1);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [shareModal, setShareModal] = useState<{ workflowId: string; shareUrl: string } | null>(null);
+  const [shareCopied, setShareCopied] = useState(false);
+  const [expandedConditions, setExpandedConditions] = useState<Set<string>>(new Set());
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   const fetchWorkflows = async () => {
     setLoading(true);
@@ -2021,6 +2269,102 @@ function FlowsTab({ token }: FlowsTabProps) {
     }
   };
 
+  const handleShare = async (id: string) => {
+    try {
+      const res = await fetch(`${backendUrl}/workflows/${id}/share`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = (await res.json()) as {
+        success: boolean;
+        data: { shareId: string; shareUrl: string };
+      };
+      if (data.success) {
+        setShareModal({ workflowId: id, shareUrl: data.data.shareUrl });
+        setShareCopied(false);
+      }
+    } catch {
+      // silently fail
+    }
+  };
+
+  const handleUnshare = async (id: string) => {
+    try {
+      await fetch(`${backendUrl}/workflows/${id}/unshare`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setShareModal(null);
+    } catch {
+      // silently fail
+    }
+  };
+
+  const handleCopyShareUrl = async () => {
+    if (!shareModal) return;
+    try {
+      await navigator.clipboard.writeText(shareModal.shareUrl);
+      setShareCopied(true);
+      setTimeout(() => setShareCopied(false), 2000);
+    } catch {
+      // fallback
+    }
+  };
+
+  const handleExport = () => {
+    const json = JSON.stringify(workflows, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'devflow-workflows.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const imported = JSON.parse(text) as Array<{
+        name: string;
+        description?: string;
+        steps: WorkflowStep[];
+      }>;
+      for (const wf of imported) {
+        await fetch(`${backendUrl}/workflows`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ name: wf.name, description: wf.description, steps: wf.steps }),
+        });
+      }
+      // Reset file input
+      if (importInputRef.current) importInputRef.current.value = '';
+      await fetchWorkflows();
+    } catch {
+      // silently fail
+    }
+  };
+
+  const toggleCondition = (stepId: string) => {
+    setExpandedConditions((prev) => {
+      const next = new Set(prev);
+      if (next.has(stepId)) {
+        next.delete(stepId);
+      } else {
+        next.add(stepId);
+      }
+      return next;
+    });
+  };
+
+  const updateStepCondition = (stepId: string, condition: string) => {
+    setFormSteps((prev) =>
+      prev.map((s) => (s.id === stepId ? { ...s, condition: condition || undefined } : s)),
+    );
+  };
+
   const runWorkflow = async (workflow: WorkflowDocument) => {
     setRunningId(workflow.id);
     setRunStepIndex(0);
@@ -2120,32 +2464,70 @@ function FlowsTab({ token }: FlowsTabProps) {
             <div
               key={step.id}
               style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
                 marginBottom: '6px',
                 background: '#0f172a',
                 borderRadius: '6px',
                 padding: '6px 10px',
               }}
             >
-              <span style={{ color: '#64748b', fontSize: '11px', minWidth: '20px' }}>
-                {idx + 1}.
-              </span>
-              <span style={{ flex: 1, color: '#e2e8f0', fontSize: '13px' }}>{step.command}</span>
-              <button
-                onClick={() => removeStep(step.id)}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  cursor: 'pointer',
-                  color: '#f87171',
-                  fontSize: '14px',
-                  padding: '2px',
-                }}
-              >
-                ✕
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ color: '#64748b', fontSize: '11px', minWidth: '20px' }}>
+                  {idx + 1}.
+                </span>
+                {step.condition && (
+                  <span title="Has condition" style={{ fontSize: '12px' }}>🔀</span>
+                )}
+                <span style={{ flex: 1, color: '#e2e8f0', fontSize: '13px' }}>{step.command}</span>
+                <button
+                  onClick={() => toggleCondition(step.id)}
+                  title="Add/edit condition"
+                  style={{
+                    background: expandedConditions.has(step.id) ? '#334155' : 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    color: '#64748b',
+                    fontSize: '11px',
+                    padding: '2px 4px',
+                    borderRadius: '3px',
+                  }}
+                >
+                  if
+                </button>
+                <button
+                  onClick={() => removeStep(step.id)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    color: '#f87171',
+                    fontSize: '14px',
+                    padding: '2px',
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              {expandedConditions.has(step.id) && (
+                <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>Only run if:</span>
+                  <input
+                    type="text"
+                    placeholder="e.g. page contains login form"
+                    value={step.condition ?? ''}
+                    onChange={(e) => updateStepCondition(step.id, e.target.value)}
+                    style={{
+                      flex: 1,
+                      background: '#1e293b',
+                      border: '1px solid #334155',
+                      borderRadius: '4px',
+                      padding: '4px 8px',
+                      color: '#e2e8f0',
+                      fontSize: '11px',
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+              )}
             </div>
           ))}
           <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
@@ -2225,30 +2607,167 @@ function FlowsTab({ token }: FlowsTabProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {/* Share Modal */}
+      {shareModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.7)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+            padding: '16px',
+          }}
+        >
+          <div
+            style={{
+              background: '#1e293b',
+              border: '1px solid #334155',
+              borderRadius: '12px',
+              padding: '20px',
+              width: '100%',
+              maxWidth: '320px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, color: '#e2e8f0', fontSize: '14px', fontWeight: 600 }}>
+                Share Workflow
+              </h3>
+              <button
+                onClick={() => setShareModal(null)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: '#64748b',
+                  cursor: 'pointer',
+                  fontSize: '16px',
+                  padding: '2px',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <input
+              readOnly
+              value={shareModal.shareUrl}
+              style={{
+                background: '#0f172a',
+                border: '1px solid #334155',
+                borderRadius: '6px',
+                padding: '8px 10px',
+                color: '#94a3b8',
+                fontSize: '12px',
+                outline: 'none',
+                width: '100%',
+                boxSizing: 'border-box',
+              }}
+            />
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={() => void handleCopyShareUrl()}
+                style={{
+                  flex: 1,
+                  background: '#6366f1',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '8px 12px',
+                  color: 'white',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                }}
+              >
+                {shareCopied ? '✓ Copied!' : 'Copy Link'}
+              </button>
+              <button
+                onClick={() => void handleUnshare(shareModal.workflowId)}
+                style={{
+                  flex: 1,
+                  background: 'transparent',
+                  border: '1px solid #ef4444',
+                  borderRadius: '6px',
+                  padding: '8px 12px',
+                  color: '#f87171',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                }}
+              >
+                Stop Sharing
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: '12px',
+          marginBottom: '8px',
+          gap: '6px',
+          flexWrap: 'wrap',
         }}
       >
         <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '15px' }}>Workflows</span>
-        <button
-          onClick={openNewForm}
-          style={{
-            background: '#6366f1',
-            color: 'white',
-            border: 'none',
-            borderRadius: '6px',
-            padding: '6px 12px',
-            fontSize: '12px',
-            cursor: 'pointer',
-          }}
-        >
-          + New Workflow
-        </button>
+        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+          <button
+            onClick={handleExport}
+            title="Export workflows"
+            style={{
+              background: 'transparent',
+              border: '1px solid #334155',
+              borderRadius: '6px',
+              padding: '5px 8px',
+              color: '#64748b',
+              cursor: 'pointer',
+              fontSize: '11px',
+            }}
+          >
+            ↓ Export
+          </button>
+          <label
+            title="Import workflows"
+            style={{
+              background: 'transparent',
+              border: '1px solid #334155',
+              borderRadius: '6px',
+              padding: '5px 8px',
+              color: '#64748b',
+              cursor: 'pointer',
+              fontSize: '11px',
+            }}
+          >
+            ↑ Import
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".json"
+              onChange={(e) => void handleImport(e)}
+              style={{ display: 'none' }}
+            />
+          </label>
+          <button
+            onClick={openNewForm}
+            style={{
+              background: '#6366f1',
+              color: 'white',
+              border: 'none',
+              borderRadius: '6px',
+              padding: '6px 12px',
+              fontSize: '12px',
+              cursor: 'pointer',
+            }}
+          >
+            + New
+          </button>
+        </div>
       </div>
 
       {workflows.length === 0 ? (
@@ -2258,7 +2777,7 @@ function FlowsTab({ token }: FlowsTabProps) {
         </div>
       ) : (
         workflows.map((wf) => {
-          const isRunning = runningId === wf.id;
+          const isRunningWf = runningId === wf.id;
           return (
             <div key={wf.id} style={cardStyle}>
               <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
@@ -2276,7 +2795,7 @@ function FlowsTab({ token }: FlowsTabProps) {
                 >
                   {wf.steps.length} step{wf.steps.length !== 1 ? 's' : ''}
                 </span>
-                {isRunning && (
+                {isRunningWf && (
                   <span
                     style={{
                       background: '#f59e0b',
@@ -2319,6 +2838,20 @@ function FlowsTab({ token }: FlowsTabProps) {
                   }}
                 >
                   ▶ Run
+                </button>
+                <button
+                  onClick={() => void handleShare(wf.id)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    padding: '4px',
+                    color: '#94a3b8',
+                  }}
+                  title="Share workflow"
+                >
+                  🔗
                 </button>
                 <button
                   onClick={() => openEditForm(wf)}
