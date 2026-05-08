@@ -11,7 +11,7 @@ import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
 import type { IdentityPublic, Memory, MemoryType } from '../../../shared/src/types';
 
-type Tab = 'agent' | 'memory' | 'vault' | 'flows' | 'schedule';
+type Tab = 'agent' | 'memory' | 'vault' | 'flows' | 'schedule' | 'settings';
 
 const tabs: { id: Tab; label: string; icon: string }[] = [
   { id: 'agent', label: 'Agent', icon: '🤖' },
@@ -19,6 +19,7 @@ const tabs: { id: Tab; label: string; icon: string }[] = [
   { id: 'vault', label: 'Vault', icon: '🔐' },
   { id: 'flows', label: 'Flows', icon: '📋' },
   { id: 'schedule', label: 'Schedule', icon: '⏰' },
+  { id: 'settings', label: 'Settings', icon: '⚙️' },
 ];
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
@@ -1855,6 +1856,1346 @@ function AgentTab({ token }: AgentTabProps) {
   );
 }
 
+// ==================== FLOWS TAB ====================
+
+interface WorkflowStep {
+  id: string;
+  command: string;
+}
+
+interface WorkflowDocument {
+  id: string;
+  userId: string;
+  name: string;
+  description?: string;
+  steps: WorkflowStep[];
+  runCount: number;
+  lastRun?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface FlowsTabProps {
+  token: string;
+}
+
+function formatTimeAgo(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'Just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function FlowsTab({ token }: FlowsTabProps) {
+  const [workflows, setWorkflows] = useState<WorkflowDocument[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [formName, setFormName] = useState('');
+  const [formDescription, setFormDescription] = useState('');
+  const [formSteps, setFormSteps] = useState<WorkflowStep[]>([]);
+  const [newStepCommand, setNewStepCommand] = useState('');
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formLoading, setFormLoading] = useState(false);
+  const [runningId, setRunningId] = useState<string | null>(null);
+  const [runStepIndex, setRunStepIndex] = useState<number>(-1);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
+  const fetchWorkflows = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${backendUrl}/workflows`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = (await res.json()) as { success: boolean; data: WorkflowDocument[] };
+      if (data.success) setWorkflows(data.data);
+    } catch {
+      // silently fail
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchWorkflows();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const openNewForm = () => {
+    setEditingId(null);
+    setFormName('');
+    setFormDescription('');
+    setFormSteps([]);
+    setNewStepCommand('');
+    setFormError(null);
+    setShowForm(true);
+  };
+
+  const openEditForm = (wf: WorkflowDocument) => {
+    setEditingId(wf.id);
+    setFormName(wf.name);
+    setFormDescription(wf.description ?? '');
+    setFormSteps(wf.steps.map((s) => ({ ...s })));
+    setNewStepCommand('');
+    setFormError(null);
+    setShowForm(true);
+  };
+
+  const cancelForm = () => {
+    setShowForm(false);
+    setEditingId(null);
+    setFormError(null);
+  };
+
+  const addStep = () => {
+    if (!newStepCommand.trim()) return;
+    setFormSteps((prev) => [
+      ...prev,
+      { id: Math.random().toString(36).slice(2), command: newStepCommand.trim() },
+    ]);
+    setNewStepCommand('');
+  };
+
+  const removeStep = (id: string) => {
+    setFormSteps((prev) => prev.filter((s) => s.id !== id));
+  };
+
+  const handleSave = async () => {
+    setFormError(null);
+    if (!formName.trim()) {
+      setFormError('Name is required');
+      return;
+    }
+    if (formSteps.length === 0) {
+      setFormError('Add at least one step');
+      return;
+    }
+    setFormLoading(true);
+    try {
+      const body = {
+        name: formName.trim(),
+        description: formDescription.trim() || undefined,
+        steps: formSteps,
+      };
+      let res: Response;
+      if (editingId) {
+        res = await fetch(`${backendUrl}/workflows/${editingId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+      } else {
+        res = await fetch(`${backendUrl}/workflows`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+      }
+      const data = (await res.json()) as { success: boolean; error?: string };
+      if (!data.success) throw new Error(data.error ?? 'Save failed');
+      setShowForm(false);
+      setEditingId(null);
+      await fetchWorkflows();
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setFormError(e.message ?? 'Save failed');
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      await fetch(`${backendUrl}/workflows/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setDeleteConfirmId(null);
+      await fetchWorkflows();
+    } catch {
+      await fetchWorkflows();
+    }
+  };
+
+  const runWorkflow = async (workflow: WorkflowDocument) => {
+    setRunningId(workflow.id);
+    setRunStepIndex(0);
+    for (let i = 0; i < workflow.steps.length; i++) {
+      setRunStepIndex(i);
+      try {
+        await fetch(`${backendUrl}/agent/run`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ command: workflow.steps[i].command }),
+        });
+      } catch {
+        // continue
+      }
+      await new Promise<void>((r) => setTimeout(r, 1500));
+    }
+    try {
+      await fetch(`${backendUrl}/workflows/${workflow.id}/run`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // ignore
+    }
+    setRunningId(null);
+    setRunStepIndex(-1);
+    await fetchWorkflows();
+  };
+
+  const cardStyle: React.CSSProperties = {
+    background: '#1e293b',
+    borderRadius: '8px',
+    padding: '12px',
+    marginBottom: '8px',
+  };
+
+  const flowsInputStyle: React.CSSProperties = {
+    background: '#1e293b',
+    border: '1px solid #334155',
+    borderRadius: '8px',
+    padding: '8px 12px',
+    color: '#e2e8f0',
+    fontSize: '13px',
+    outline: 'none',
+    width: '100%',
+    boxSizing: 'border-box',
+  };
+
+  if (loading) {
+    return (
+      <div style={{ textAlign: 'center', color: '#475569', marginTop: '60px' }}>
+        <div
+          style={{
+            width: '32px',
+            height: '32px',
+            border: '3px solid #334155',
+            borderTop: '3px solid #6366f1',
+            borderRadius: '50%',
+            margin: '0 auto 12px',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+        <p>Loading workflows...</p>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  if (showForm) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        <h3 style={{ color: '#818cf8', margin: 0, fontSize: '15px' }}>
+          {editingId ? 'Edit Workflow' : 'New Workflow'}
+        </h3>
+
+        <input
+          type="text"
+          placeholder="Workflow name *"
+          value={formName}
+          onChange={(e) => setFormName(e.target.value)}
+          style={flowsInputStyle}
+        />
+
+        <input
+          type="text"
+          placeholder="Description (optional)"
+          value={formDescription}
+          onChange={(e) => setFormDescription(e.target.value)}
+          style={flowsInputStyle}
+        />
+
+        <div>
+          <p style={{ color: '#94a3b8', fontSize: '12px', margin: '0 0 8px 0', fontWeight: 600 }}>
+            Steps ({formSteps.length})
+          </p>
+          {formSteps.map((step, idx) => (
+            <div
+              key={step.id}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                marginBottom: '6px',
+                background: '#0f172a',
+                borderRadius: '6px',
+                padding: '6px 10px',
+              }}
+            >
+              <span style={{ color: '#64748b', fontSize: '11px', minWidth: '20px' }}>
+                {idx + 1}.
+              </span>
+              <span style={{ flex: 1, color: '#e2e8f0', fontSize: '13px' }}>{step.command}</span>
+              <button
+                onClick={() => removeStep(step.id)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: '#f87171',
+                  fontSize: '14px',
+                  padding: '2px',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
+            <input
+              type="text"
+              placeholder="Add step command..."
+              value={newStepCommand}
+              onChange={(e) => setNewStepCommand(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addStep();
+                }
+              }}
+              style={{ ...flowsInputStyle, flex: 1 }}
+            />
+            <button
+              onClick={addStep}
+              style={{
+                background: '#334155',
+                color: '#e2e8f0',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '8px 12px',
+                fontSize: '13px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Add
+            </button>
+          </div>
+        </div>
+
+        {formError && (
+          <p style={{ color: '#f87171', fontSize: '12px', margin: 0 }}>{formError}</p>
+        )}
+
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            onClick={() => void handleSave()}
+            disabled={formLoading}
+            style={{
+              flex: 1,
+              background: '#6366f1',
+              border: 'none',
+              borderRadius: '6px',
+              padding: '8px 16px',
+              color: 'white',
+              fontSize: '13px',
+              cursor: formLoading ? 'not-allowed' : 'pointer',
+              opacity: formLoading ? 0.7 : 1,
+            }}
+          >
+            {formLoading ? 'Saving...' : 'Save'}
+          </button>
+          <button
+            onClick={cancelForm}
+            disabled={formLoading}
+            style={{
+              flex: 1,
+              background: 'transparent',
+              border: '1px solid #334155',
+              borderRadius: '6px',
+              padding: '8px 16px',
+              color: '#94a3b8',
+              fontSize: '13px',
+              cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: '12px',
+        }}
+      >
+        <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '15px' }}>Workflows</span>
+        <button
+          onClick={openNewForm}
+          style={{
+            background: '#6366f1',
+            color: 'white',
+            border: 'none',
+            borderRadius: '6px',
+            padding: '6px 12px',
+            fontSize: '12px',
+            cursor: 'pointer',
+          }}
+        >
+          + New Workflow
+        </button>
+      </div>
+
+      {workflows.length === 0 ? (
+        <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
+          <div style={{ fontSize: '40px', marginBottom: '12px' }}>📋</div>
+          <p style={{ fontSize: '13px' }}>No workflows yet. Create your first one!</p>
+        </div>
+      ) : (
+        workflows.map((wf) => {
+          const isRunning = runningId === wf.id;
+          return (
+            <div key={wf.id} style={cardStyle}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
+                <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1 }}>
+                  {wf.name}
+                </span>
+                <span
+                  style={{
+                    background: '#334155',
+                    color: '#94a3b8',
+                    borderRadius: '4px',
+                    padding: '2px 6px',
+                    fontSize: '11px',
+                  }}
+                >
+                  {wf.steps.length} step{wf.steps.length !== 1 ? 's' : ''}
+                </span>
+                {isRunning && (
+                  <span
+                    style={{
+                      background: '#f59e0b',
+                      color: '#0f172a',
+                      borderRadius: '4px',
+                      padding: '2px 6px',
+                      fontSize: '11px',
+                      fontWeight: 600,
+                    }}
+                  >
+                    ⏳ Running step {runStepIndex + 1}/{wf.steps.length}...
+                  </span>
+                )}
+              </div>
+
+              {wf.description && (
+                <p style={{ color: '#94a3b8', fontSize: '12px', margin: '0 0 6px 0' }}>
+                  {wf.description}
+                </p>
+              )}
+
+              <div style={{ display: 'flex', gap: '12px', fontSize: '11px', color: '#64748b', marginBottom: '8px' }}>
+                <span>{wf.lastRun ? `Last run: ${formatTimeAgo(wf.lastRun)}` : 'Never run'}</span>
+                <span>Runs: {wf.runCount}</span>
+              </div>
+
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  onClick={() => void runWorkflow(wf)}
+                  disabled={runningId !== null}
+                  style={{
+                    background: runningId !== null ? '#334155' : '#10b981',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '5px',
+                    padding: '4px 10px',
+                    fontSize: '12px',
+                    cursor: runningId !== null ? 'not-allowed' : 'pointer',
+                    opacity: runningId !== null ? 0.6 : 1,
+                  }}
+                >
+                  ▶ Run
+                </button>
+                <button
+                  onClick={() => openEditForm(wf)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    padding: '4px',
+                    color: '#94a3b8',
+                  }}
+                  title="Edit"
+                >
+                  ✏️
+                </button>
+                <button
+                  onClick={() => setDeleteConfirmId(wf.id)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    padding: '4px',
+                    color: '#94a3b8',
+                  }}
+                  title="Delete"
+                >
+                  🗑
+                </button>
+              </div>
+
+              {deleteConfirmId === wf.id && (
+                <div
+                  style={{
+                    marginTop: '10px',
+                    padding: '10px',
+                    background: '#0f172a',
+                    borderRadius: '6px',
+                    border: '1px solid #ef4444',
+                  }}
+                >
+                  <p style={{ margin: '0 0 8px 0', fontSize: '12px', color: '#fca5a5' }}>
+                    Delete &quot;{wf.name}&quot;? This cannot be undone.
+                  </p>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={() => void handleDelete(wf.id)}
+                      style={{
+                        background: '#ef4444',
+                        border: 'none',
+                        borderRadius: '6px',
+                        padding: '5px 12px',
+                        color: 'white',
+                        cursor: 'pointer',
+                        fontSize: '12px',
+                      }}
+                    >
+                      Delete
+                    </button>
+                    <button
+                      onClick={() => setDeleteConfirmId(null)}
+                      style={{
+                        background: 'transparent',
+                        border: '1px solid #334155',
+                        borderRadius: '6px',
+                        padding: '5px 12px',
+                        color: '#94a3b8',
+                        cursor: 'pointer',
+                        fontSize: '12px',
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+// ==================== SCHEDULE TAB ====================
+
+interface ScheduleDocument {
+  id: string;
+  userId: string;
+  command: string;
+  cronExpression: string;
+  humanReadable: string;
+  isActive: boolean;
+  lastRun?: string;
+  lastRunStatus?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ScheduleTabProps {
+  token: string;
+}
+
+const CRON_PRESETS = [
+  { label: 'Every hour', cron: '0 * * * *', human: 'Every hour' },
+  { label: 'Daily at 9 AM', cron: '0 9 * * *', human: 'Daily at 9:00 AM' },
+  { label: 'Daily at 6 PM', cron: '0 18 * * *', human: 'Daily at 6:00 PM' },
+  { label: 'Every Monday', cron: '0 9 * * 1', human: 'Every Monday at 9:00 AM' },
+  { label: 'Custom', cron: '', human: '' },
+];
+
+function ScheduleTab({ token }: ScheduleTabProps) {
+  const [schedules, setSchedules] = useState<ScheduleDocument[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [formCommand, setFormCommand] = useState('');
+  const [selectedPreset, setSelectedPreset] = useState(0);
+  const [customCron, setCustomCron] = useState('');
+  const [customHuman, setCustomHuman] = useState('');
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formLoading, setFormLoading] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
+  const fetchSchedules = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${backendUrl}/schedules`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = (await res.json()) as { success: boolean; data: ScheduleDocument[] };
+      if (data.success) setSchedules(data.data);
+    } catch {
+      // silently fail
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchSchedules();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const openNewForm = () => {
+    setEditingId(null);
+    setFormCommand('');
+    setSelectedPreset(0);
+    setCustomCron('');
+    setCustomHuman('');
+    setFormError(null);
+    setShowForm(true);
+  };
+
+  const openEditForm = (s: ScheduleDocument) => {
+    setEditingId(s.id);
+    setFormCommand(s.command);
+    const presetIdx = CRON_PRESETS.findIndex((p) => p.cron === s.cronExpression);
+    if (presetIdx >= 0 && presetIdx < CRON_PRESETS.length - 1) {
+      setSelectedPreset(presetIdx);
+      setCustomCron('');
+      setCustomHuman('');
+    } else {
+      setSelectedPreset(CRON_PRESETS.length - 1);
+      setCustomCron(s.cronExpression);
+      setCustomHuman(s.humanReadable);
+    }
+    setFormError(null);
+    setShowForm(true);
+  };
+
+  const cancelForm = () => {
+    setShowForm(false);
+    setEditingId(null);
+    setFormError(null);
+  };
+
+  const handleSave = async () => {
+    setFormError(null);
+    if (!formCommand.trim()) {
+      setFormError('Command is required');
+      return;
+    }
+    const isCustom = selectedPreset === CRON_PRESETS.length - 1;
+    const cronExpression = isCustom ? customCron.trim() : CRON_PRESETS[selectedPreset].cron;
+    const humanReadable = isCustom ? customHuman.trim() : CRON_PRESETS[selectedPreset].human;
+    if (!cronExpression) {
+      setFormError('Cron expression is required');
+      return;
+    }
+    setFormLoading(true);
+    try {
+      const body = { command: formCommand.trim(), cronExpression, humanReadable };
+      let res: Response;
+      if (editingId) {
+        res = await fetch(`${backendUrl}/schedules/${editingId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+      } else {
+        res = await fetch(`${backendUrl}/schedules`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+      }
+      const data = (await res.json()) as { success: boolean; error?: string };
+      if (!data.success) throw new Error(data.error ?? 'Save failed');
+      setShowForm(false);
+      setEditingId(null);
+      await fetchSchedules();
+    } catch (err: unknown) {
+      const e = err as { message?: string };
+      setFormError(e.message ?? 'Save failed');
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      await fetch(`${backendUrl}/schedules/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setDeleteConfirmId(null);
+      await fetchSchedules();
+    } catch {
+      await fetchSchedules();
+    }
+  };
+
+  const handleToggleActive = async (s: ScheduleDocument) => {
+    try {
+      await fetch(`${backendUrl}/schedules/${s.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ isActive: !s.isActive }),
+      });
+      await fetchSchedules();
+    } catch {
+      // ignore
+    }
+  };
+
+  const schedInputStyle: React.CSSProperties = {
+    background: '#1e293b',
+    border: '1px solid #334155',
+    borderRadius: '8px',
+    padding: '8px 12px',
+    color: '#e2e8f0',
+    fontSize: '13px',
+    outline: 'none',
+    width: '100%',
+    boxSizing: 'border-box',
+  };
+
+  const cardStyle: React.CSSProperties = {
+    background: '#1e293b',
+    borderRadius: '8px',
+    padding: '12px',
+    marginBottom: '8px',
+  };
+
+  if (loading) {
+    return (
+      <div style={{ textAlign: 'center', color: '#475569', marginTop: '60px' }}>
+        <div
+          style={{
+            width: '32px',
+            height: '32px',
+            border: '3px solid #334155',
+            borderTop: '3px solid #6366f1',
+            borderRadius: '50%',
+            margin: '0 auto 12px',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+        <p>Loading schedules...</p>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  if (showForm) {
+    const isCustom = selectedPreset === CRON_PRESETS.length - 1;
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        <h3 style={{ color: '#818cf8', margin: 0, fontSize: '15px' }}>
+          {editingId ? 'Edit Schedule' : 'New Schedule'}
+        </h3>
+
+        <div>
+          <label style={{ color: '#94a3b8', fontSize: '12px', display: 'block', marginBottom: '4px' }}>
+            Command *
+          </label>
+          <textarea
+            placeholder="What should the agent do?"
+            value={formCommand}
+            onChange={(e) => setFormCommand(e.target.value)}
+            rows={3}
+            style={{
+              ...schedInputStyle,
+              resize: 'none',
+            }}
+          />
+        </div>
+
+        <div>
+          <label style={{ color: '#94a3b8', fontSize: '12px', display: 'block', marginBottom: '4px' }}>
+            Schedule
+          </label>
+          <select
+            value={selectedPreset}
+            onChange={(e) => setSelectedPreset(Number(e.target.value))}
+            style={{
+              ...schedInputStyle,
+              cursor: 'pointer',
+            }}
+          >
+            {CRON_PRESETS.map((p, i) => (
+              <option key={i} value={i} style={{ background: '#1e293b', color: '#e2e8f0' }}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {isCustom && (
+          <>
+            <input
+              type="text"
+              placeholder="Cron expression (e.g. 0 9 * * 1)"
+              value={customCron}
+              onChange={(e) => setCustomCron(e.target.value)}
+              style={schedInputStyle}
+            />
+            <input
+              type="text"
+              placeholder="Human readable description"
+              value={customHuman}
+              onChange={(e) => setCustomHuman(e.target.value)}
+              style={schedInputStyle}
+            />
+          </>
+        )}
+
+        {formError && (
+          <p style={{ color: '#f87171', fontSize: '12px', margin: 0 }}>{formError}</p>
+        )}
+
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            onClick={() => void handleSave()}
+            disabled={formLoading}
+            style={{
+              flex: 1,
+              background: '#6366f1',
+              border: 'none',
+              borderRadius: '6px',
+              padding: '8px 16px',
+              color: 'white',
+              fontSize: '13px',
+              cursor: formLoading ? 'not-allowed' : 'pointer',
+              opacity: formLoading ? 0.7 : 1,
+            }}
+          >
+            {formLoading ? 'Saving...' : 'Save'}
+          </button>
+          <button
+            onClick={cancelForm}
+            disabled={formLoading}
+            style={{
+              flex: 1,
+              background: 'transparent',
+              border: '1px solid #334155',
+              borderRadius: '6px',
+              padding: '8px 16px',
+              color: '#94a3b8',
+              fontSize: '13px',
+              cursor: 'pointer',
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: '12px',
+        }}
+      >
+        <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '15px' }}>Schedules</span>
+        <button
+          onClick={openNewForm}
+          style={{
+            background: '#6366f1',
+            color: 'white',
+            border: 'none',
+            borderRadius: '6px',
+            padding: '6px 12px',
+            fontSize: '12px',
+            cursor: 'pointer',
+          }}
+        >
+          + New Schedule
+        </button>
+      </div>
+
+      {schedules.length === 0 ? (
+        <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
+          <div style={{ fontSize: '40px', marginBottom: '12px' }}>⏰</div>
+          <p style={{ fontSize: '13px' }}>No schedules set. Automate your routine tasks!</p>
+        </div>
+      ) : (
+        schedules.map((s) => (
+          <div key={s.id} style={cardStyle}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '6px' }}>
+              <span
+                style={{
+                  flex: 1,
+                  color: '#e2e8f0',
+                  fontSize: '13px',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+                title={s.command}
+              >
+                {s.command.length > 60 ? s.command.slice(0, 60) + '…' : s.command}
+              </span>
+              {/* Active toggle */}
+              <button
+                onClick={() => void handleToggleActive(s)}
+                title={s.isActive ? 'Disable' : 'Enable'}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  padding: 0,
+                  flexShrink: 0,
+                }}
+              >
+                <div
+                  style={{
+                    width: '36px',
+                    height: '20px',
+                    borderRadius: '10px',
+                    background: s.isActive ? '#6366f1' : '#334155',
+                    position: 'relative',
+                    transition: 'background 0.2s',
+                  }}
+                >
+                  <div
+                    style={{
+                      width: '16px',
+                      height: '16px',
+                      borderRadius: '50%',
+                      background: 'white',
+                      position: 'absolute',
+                      top: '2px',
+                      left: s.isActive ? '18px' : '2px',
+                      transition: 'left 0.2s',
+                    }}
+                  />
+                </div>
+              </button>
+            </div>
+
+            <p style={{ color: '#94a3b8', fontSize: '12px', margin: '0 0 4px 0' }}>
+              {s.humanReadable || s.cronExpression}
+            </p>
+
+            <div style={{ display: 'flex', gap: '12px', fontSize: '11px', color: '#64748b', marginBottom: '8px' }}>
+              <span>{s.lastRun ? `Last run: ${formatTimeAgo(s.lastRun)}` : 'Never run'}</span>
+              {s.lastRunStatus && (
+                <span
+                  style={{
+                    color: s.lastRunStatus === 'success' ? '#10b981' : '#f87171',
+                  }}
+                >
+                  {s.lastRunStatus}
+                </span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                onClick={() => openEditForm(s)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  padding: '4px',
+                  color: '#94a3b8',
+                }}
+                title="Edit"
+              >
+                ✏️
+              </button>
+              <button
+                onClick={() => setDeleteConfirmId(s.id)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  padding: '4px',
+                  color: '#94a3b8',
+                }}
+                title="Delete"
+              >
+                🗑
+              </button>
+            </div>
+
+            {deleteConfirmId === s.id && (
+              <div
+                style={{
+                  marginTop: '10px',
+                  padding: '10px',
+                  background: '#0f172a',
+                  borderRadius: '6px',
+                  border: '1px solid #ef4444',
+                }}
+              >
+                <p style={{ margin: '0 0 8px 0', fontSize: '12px', color: '#fca5a5' }}>
+                  Delete this schedule? This cannot be undone.
+                </p>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    onClick={() => void handleDelete(s.id)}
+                    style={{
+                      background: '#ef4444',
+                      border: 'none',
+                      borderRadius: '6px',
+                      padding: '5px 12px',
+                      color: 'white',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    Delete
+                  </button>
+                  <button
+                    onClick={() => setDeleteConfirmId(null)}
+                    style={{
+                      background: 'transparent',
+                      border: '1px solid #334155',
+                      borderRadius: '6px',
+                      padding: '5px 12px',
+                      color: '#94a3b8',
+                      cursor: 'pointer',
+                      fontSize: '12px',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+// ==================== SETTINGS TAB ====================
+
+interface UserSettings {
+  theme?: string;
+  fontSize?: string;
+  language?: string;
+  autoScreenshot?: boolean;
+  askBeforeSubmit?: boolean;
+  progressNotifications?: boolean;
+}
+
+interface SettingsTabProps {
+  token: string;
+}
+
+function SettingsTab({ token }: SettingsTabProps) {
+  const [settings, setSettings] = useState<UserSettings>({
+    theme: 'dark',
+    fontSize: 'medium',
+    language: 'english',
+    autoScreenshot: true,
+    askBeforeSubmit: true,
+    progressNotifications: true,
+  });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      try {
+        const res = await fetch(`${backendUrl}/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = (await res.json()) as {
+          success: boolean;
+          data?: { settings?: UserSettings };
+          error?: string;
+        };
+        if (data.success && data.data?.settings) {
+          setSettings((prev) => ({ ...prev, ...data.data!.settings }));
+        }
+      } catch {
+        // use defaults
+      } finally {
+        setLoading(false);
+      }
+    };
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await fetch(`${backendUrl}/auth/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(settings),
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      // ignore
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const Toggle = ({
+    value,
+    onChange,
+  }: {
+    value: boolean;
+    onChange: (v: boolean) => void;
+  }) => (
+    <button
+      onClick={() => onChange(!value)}
+      style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+    >
+      <div
+        style={{
+          width: '40px',
+          height: '22px',
+          borderRadius: '11px',
+          background: value ? '#6366f1' : '#334155',
+          position: 'relative',
+          transition: 'background 0.2s',
+        }}
+      >
+        <div
+          style={{
+            width: '18px',
+            height: '18px',
+            borderRadius: '50%',
+            background: 'white',
+            position: 'absolute',
+            top: '2px',
+            left: value ? '20px' : '2px',
+            transition: 'left 0.2s',
+          }}
+        />
+      </div>
+    </button>
+  );
+
+  const SegmentedControl = ({
+    value,
+    options,
+    onChange,
+  }: {
+    value: string;
+    options: { label: string; value: string }[];
+    onChange: (v: string) => void;
+  }) => (
+    <div
+      style={{
+        display: 'flex',
+        background: '#0f172a',
+        borderRadius: '6px',
+        padding: '2px',
+        gap: '2px',
+      }}
+    >
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          onClick={() => onChange(opt.value)}
+          style={{
+            flex: 1,
+            background: value === opt.value ? '#6366f1' : 'transparent',
+            color: value === opt.value ? 'white' : '#64748b',
+            border: 'none',
+            borderRadius: '4px',
+            padding: '5px 8px',
+            fontSize: '12px',
+            cursor: 'pointer',
+            transition: 'background 0.15s',
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+
+  const sectionHeaderStyle: React.CSSProperties = {
+    color: '#64748b',
+    fontSize: '11px',
+    fontWeight: 600,
+    textTransform: 'uppercase',
+    letterSpacing: '0.05em',
+    margin: '16px 0 8px 0',
+  };
+
+  const rowStyle: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '8px 0',
+    borderBottom: '1px solid #1e293b',
+  };
+
+  const labelStyle: React.CSSProperties = {
+    color: '#e2e8f0',
+    fontSize: '13px',
+  };
+
+  if (loading) {
+    return (
+      <div style={{ textAlign: 'center', color: '#475569', marginTop: '60px' }}>
+        <div
+          style={{
+            width: '32px',
+            height: '32px',
+            border: '3px solid #334155',
+            borderTop: '3px solid #6366f1',
+            borderRadius: '50%',
+            margin: '0 auto 12px',
+            animation: 'spin 1s linear infinite',
+          }}
+        />
+        <p>Loading settings...</p>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column' }}>
+      {/* Appearance */}
+      <p style={sectionHeaderStyle}>Appearance</p>
+
+      <div style={{ ...rowStyle, flexDirection: 'column', alignItems: 'flex-start', gap: '8px' }}>
+        <span style={labelStyle}>Theme</span>
+        <SegmentedControl
+          value={settings.theme ?? 'dark'}
+          options={[
+            { label: 'Dark', value: 'dark' },
+            { label: 'Light', value: 'light' },
+            { label: 'System', value: 'system' },
+          ]}
+          onChange={(v) => setSettings((s) => ({ ...s, theme: v }))}
+        />
+      </div>
+
+      <div style={{ ...rowStyle, flexDirection: 'column', alignItems: 'flex-start', gap: '8px' }}>
+        <span style={labelStyle}>Font Size</span>
+        <SegmentedControl
+          value={settings.fontSize ?? 'medium'}
+          options={[
+            { label: 'Small', value: 'small' },
+            { label: 'Medium', value: 'medium' },
+            { label: 'Large', value: 'large' },
+          ]}
+          onChange={(v) => setSettings((s) => ({ ...s, fontSize: v }))}
+        />
+      </div>
+
+      <div style={{ ...rowStyle, flexDirection: 'column', alignItems: 'flex-start', gap: '8px' }}>
+        <span style={labelStyle}>Language</span>
+        <SegmentedControl
+          value={settings.language ?? 'english'}
+          options={[
+            { label: 'English', value: 'english' },
+            { label: 'Hinglish', value: 'hinglish' },
+            { label: 'Hindi', value: 'hindi' },
+          ]}
+          onChange={(v) => setSettings((s) => ({ ...s, language: v }))}
+        />
+      </div>
+
+      {/* Behavior */}
+      <p style={sectionHeaderStyle}>Behavior</p>
+
+      <div style={rowStyle}>
+        <div>
+          <span style={labelStyle}>Auto Screenshot</span>
+          <p style={{ color: '#64748b', fontSize: '11px', margin: '2px 0 0 0' }}>
+            Capture screenshots during tasks
+          </p>
+        </div>
+        <Toggle
+          value={settings.autoScreenshot ?? true}
+          onChange={(v) => setSettings((s) => ({ ...s, autoScreenshot: v }))}
+        />
+      </div>
+
+      <div style={rowStyle}>
+        <div>
+          <span style={labelStyle}>Ask Before Submit</span>
+          <p style={{ color: '#64748b', fontSize: '11px', margin: '2px 0 0 0' }}>
+            Confirm before submitting forms
+          </p>
+        </div>
+        <Toggle
+          value={settings.askBeforeSubmit ?? true}
+          onChange={(v) => setSettings((s) => ({ ...s, askBeforeSubmit: v }))}
+        />
+      </div>
+
+      <div style={rowStyle}>
+        <div>
+          <span style={labelStyle}>Progress Notifications</span>
+          <p style={{ color: '#64748b', fontSize: '11px', margin: '2px 0 0 0' }}>
+            Show task progress updates
+          </p>
+        </div>
+        <Toggle
+          value={settings.progressNotifications ?? true}
+          onChange={(v) => setSettings((s) => ({ ...s, progressNotifications: v }))}
+        />
+      </div>
+
+      <button
+        onClick={() => void handleSave()}
+        disabled={saving}
+        style={{
+          marginTop: '20px',
+          background: '#6366f1',
+          border: 'none',
+          borderRadius: '8px',
+          padding: '10px 16px',
+          color: 'white',
+          fontSize: '13px',
+          fontWeight: 600,
+          cursor: saving ? 'not-allowed' : 'pointer',
+          opacity: saving ? 0.7 : 1,
+          width: '100%',
+        }}
+      >
+        {saving ? 'Saving...' : saved ? 'Saved!' : 'Save Settings'}
+      </button>
+    </div>
+  );
+}
+
 // ==================== MAIN SIDEPANEL ====================
 
 function SidePanel() {
@@ -1997,7 +3338,7 @@ function SidePanel() {
       <div
         style={{
           flex: 1,
-          overflow: activeTab === 'agent' ? 'hidden' : 'auto',
+          overflow: ['agent'].includes(activeTab) ? 'hidden' : 'auto',
           padding: '16px',
           display: 'flex',
           flexDirection: 'column',
@@ -2006,20 +3347,9 @@ function SidePanel() {
         {activeTab === 'agent' && token && <AgentTab token={token} />}
         {activeTab === 'memory' && token && <MemoryTab token={token} />}
         {activeTab === 'vault' && token && <VaultTab token={token} />}
-        {activeTab === 'flows' && (
-          <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
-            <div style={{ fontSize: '48px', marginBottom: '12px' }}>📋</div>
-            <p>No workflows saved yet.</p>
-            <p style={{ fontSize: '13px', marginTop: '8px' }}>Record your first workflow!</p>
-          </div>
-        )}
-        {activeTab === 'schedule' && (
-          <div style={{ textAlign: 'center', color: '#475569', marginTop: '40px' }}>
-            <div style={{ fontSize: '48px', marginBottom: '12px' }}>⏰</div>
-            <p>No schedules set.</p>
-            <p style={{ fontSize: '13px', marginTop: '8px' }}>Automate your routine tasks!</p>
-          </div>
-        )}
+        {activeTab === 'flows' && token && <FlowsTab token={token} />}
+        {activeTab === 'schedule' && token && <ScheduleTab token={token} />}
+        {activeTab === 'settings' && token && <SettingsTab token={token} />}
       </div>
     </div>
   );
