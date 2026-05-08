@@ -62,6 +62,27 @@ export async function authRoutes(fastify: FastifyInstance): Promise<void> {
     },
   );
 
+  // GET /stats — return counts of memories, workflows, and schedules for user
+  fastify.get('/stats', { preHandler: authMiddleware }, async (request, reply) => {
+    const { uid } = request.user;
+
+    const [memoriesSnap, workflowsSnap, schedulesSnap] = await Promise.all([
+      db.collection('memories').doc(uid).collection('items').get(),
+      db.collection('workflows').doc(uid).collection('items').get(),
+      db.collection('schedules').doc(uid).collection('items').get(),
+    ]);
+
+    return reply.send({
+      success: true,
+      data: {
+        memories: memoriesSnap.size,
+        workflows: workflowsSnap.size,
+        schedules: schedulesSnap.size,
+        activeSchedules: schedulesSnap.docs.filter((d) => d.data().isActive).length,
+      },
+    });
+  });
+
   // POST /logout — clear session (token revocation handled client-side)
   fastify.post(
     '/logout',

@@ -10,8 +10,9 @@ import { vaultRoutes } from './routes/vault';
 import { memoryRoutes } from './routes/memory';
 import { preferencesRoutes } from './routes/preferences';
 import { agentRoutes } from './routes/agent';
-import { workflowRoutes } from './routes/workflows';
+import { workflowRoutes, workflowSharedRoutes } from './routes/workflows';
 import { scheduleRoutes } from './routes/schedules';
+import { startScheduler } from './services/scheduler';
 
 const server = Fastify({
   logger:
@@ -45,6 +46,7 @@ async function start() {
   await server.register(preferencesRoutes, { prefix: '/preferences' });
   await server.register(agentRoutes, { prefix: '/agent' });
   await server.register(workflowRoutes, { prefix: '/workflows' });
+  await server.register(workflowSharedRoutes, { prefix: '/workflows/shared' });
   await server.register(scheduleRoutes, { prefix: '/schedules' });
 
   server.setErrorHandler((error, _request, reply) => {
@@ -66,6 +68,7 @@ async function start() {
   process.on('SIGINT', shutdown);
 
   await server.listen({ port: config.PORT, host: '0.0.0.0' });
+  startScheduler();
 }
 
 start().catch((err) => {
