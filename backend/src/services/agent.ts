@@ -111,7 +111,7 @@ export async function runAgent(params: {
       }
 
       const response = await anthropic.messages.create({
-        model: 'claude-opus-4-7',
+        model: (process.env.AGENT_MODEL ?? 'claude-opus-4-7') as Anthropic.Model,
         max_tokens: 4096,
         system: SYSTEM_PROMPT,
         tools: toolRegistry.toAnthropicTools() as Anthropic.Tool[],
