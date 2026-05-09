@@ -5,8 +5,38 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DevFlow AI</title>
     <style>
+      :root {
+        --bg-base: #0f172a;
+        --bg-card: #1e293b;
+        --bg-border: #334155;
+        --text-primary: #e2e8f0;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --accent: #6366f1;
+        --accent-light: #818cf8;
+        --success: #10b981;
+        --error: #f87171;
+        --warning: #f59e0b;
+      }
+      [data-theme="light"] {
+        --bg-base: #f8fafc;
+        --bg-card: #ffffff;
+        --bg-border: #e2e8f0;
+        --text-primary: #0f172a;
+        --text-secondary: #475569;
+        --text-muted: #64748b;
+        --accent: #6366f1;
+        --accent-light: #6366f1;
+      }
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      body { height: 100vh; background: #0f172a; color: #e2e8f0; font-family: system-ui, sans-serif; overflow: hidden; }
+      body {
+        height: 100vh;
+        background: var(--bg-base);
+        color: var(--text-primary);
+        font-family: system-ui, -apple-system, sans-serif;
+        overflow: hidden;
+      }
+      #root { height: 100vh; }
     </style>
   </head>
   <body>

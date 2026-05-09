@@ -3473,21 +3473,34 @@ function SettingsTab({ token }: SettingsTabProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [agentModel, setAgentModel] = useState('claude-opus-4-7');
+  const [agentKeyOk, setAgentKeyOk] = useState<boolean | null>(null);
 
   useEffect(() => {
     const load = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`${backendUrl}/auth/me`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const data = (await res.json()) as {
+        const [meRes, cfgRes] = await Promise.all([
+          fetch(`${backendUrl}/auth/me`, { headers: { Authorization: `Bearer ${token}` } }),
+          fetch(`${backendUrl}/agent/config`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null),
+        ]);
+        const meData = (await meRes.json()) as {
           success: boolean;
           data?: { settings?: UserSettings };
-          error?: string;
         };
-        if (data.success && data.data?.settings) {
-          setSettings((prev) => ({ ...prev, ...data.data!.settings }));
+        if (meData.success && meData.data?.settings) {
+          const s = meData.data.settings;
+          setSettings((prev) => ({ ...prev, ...s }));
+          // Apply saved theme immediately
+          if (s.theme) {
+            applyTheme(s.theme);
+            chrome.storage.local.set({ theme: s.theme });
+          }
+        }
+        if (cfgRes?.ok) {
+          const cfgData = (await cfgRes.json()) as { model: string; hasAnthropicKey: boolean };
+          setAgentModel(cfgData.model);
+          setAgentKeyOk(cfgData.hasAnthropicKey);
         }
       } catch {
         // use defaults
@@ -3502,13 +3515,20 @@ function SettingsTab({ token }: SettingsTabProps) {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await fetch(`${backendUrl}/auth/settings`, {
+      const res = await fetch(`${backendUrl}/auth/settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(settings),
       });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      if (res.ok) {
+        // Apply theme immediately and persist in local storage
+        if (settings.theme) {
+          applyTheme(settings.theme);
+          chrome.storage.local.set({ theme: settings.theme });
+        }
+        setSaved(true);
+        setTimeout(() => setSaved(false), 2000);
+      }
     } catch {
       // ignore
     } finally {
@@ -3721,6 +3741,32 @@ function SettingsTab({ token }: SettingsTabProps) {
         />
       </div>
 
+      {/* AI Agent Configuration */}
+      <div style={{ margin: '20px 0 8px', fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+        AI Agent
+      </div>
+      <div style={{ background: '#1e293b', borderRadius: '8px', padding: '12px', border: '1px solid #334155' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+          <span style={{ color: '#e2e8f0', fontSize: '13px' }}>Anthropic API Key</span>
+          <span style={{
+            background: agentKeyOk === null ? '#334155' : agentKeyOk ? '#064e3b' : '#7f1d1d',
+            color: agentKeyOk === null ? '#94a3b8' : agentKeyOk ? '#6ee7b7' : '#fca5a5',
+            padding: '2px 8px', borderRadius: '10px', fontSize: '11px',
+          }}>
+            {agentKeyOk === null ? 'Checking…' : agentKeyOk ? '✓ Configured' : '✗ Missing'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ color: '#e2e8f0', fontSize: '13px' }}>Active Model</span>
+          <span style={{ color: '#818cf8', fontSize: '12px', fontFamily: 'monospace' }}>{agentModel}</span>
+        </div>
+        {!agentKeyOk && agentKeyOk !== null && (
+          <p style={{ color: '#f87171', fontSize: '11px', marginTop: '8px' }}>
+            Set ANTHROPIC_API_KEY in backend/.env to enable the AI agent.
+          </p>
+        )}
+      </div>
+
       <button
         onClick={() => void handleSave()}
         disabled={saving}
@@ -3738,7 +3784,7 @@ function SettingsTab({ token }: SettingsTabProps) {
           width: '100%',
         }}
       >
-        {saving ? 'Saving...' : saved ? 'Saved!' : 'Save Settings'}
+        {saving ? 'Saving...' : saved ? '✓ Saved!' : 'Save Settings'}
       </button>
     </div>
   );
@@ -3746,9 +3792,28 @@ function SettingsTab({ token }: SettingsTabProps) {
 
 // ==================== MAIN SIDEPANEL ====================
 
+// Apply theme to <html> element so CSS variables take effect
+function applyTheme(theme: string) {
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const effective = theme === 'system' ? (systemDark ? 'dark' : 'light') : theme;
+  document.documentElement.setAttribute('data-theme', effective);
+}
+
 function SidePanel() {
   const { user, token, isLoading, setUser, setToken, setLoading } = useAuthStore();
   const [activeTab, setActiveTab] = useState<Tab>('agent');
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+
+  // Load saved theme and check backend health on mount
+  useEffect(() => {
+    chrome.storage.local.get(['theme'], (result) => {
+      applyTheme((result.theme as string | undefined) ?? 'dark');
+    });
+    // Probe backend health
+    fetch(`${backendUrl}/health`, { signal: AbortSignal.timeout(4000) })
+      .then((r) => setBackendOnline(r.ok))
+      .catch(() => setBackendOnline(false));
+  }, []);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -3818,20 +3883,31 @@ function SidePanel() {
   const initial = displayName.charAt(0).toUpperCase();
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: '#0f172a' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg-base, #0f172a)' }}>
+      {/* Backend offline warning */}
+      {backendOnline === false && (
+        <div style={{
+          background: '#7c2d12', color: '#fca5a5', padding: '6px 12px',
+          fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px',
+          borderBottom: '1px solid #991b1b',
+        }}>
+          <span>⚠️</span>
+          <span>Backend offline — start the server: <code style={{ background: '#450a0a', padding: '1px 4px', borderRadius: '3px' }}>npm run dev -w @devflow/backend</code></span>
+        </div>
+      )}
       {/* Header */}
       <div
         style={{
           padding: '12px 16px',
-          background: '#1e293b',
-          borderBottom: '1px solid #334155',
+          background: 'var(--bg-card, #1e293b)',
+          borderBottom: '1px solid var(--bg-border, #334155)',
           display: 'flex',
           alignItems: 'center',
           gap: '10px',
         }}
       >
         <span style={{ fontSize: '20px' }}>🤖</span>
-        <span style={{ fontWeight: 'bold', color: '#818cf8', fontSize: '16px' }}>DevFlow AI</span>
+        <span style={{ fontWeight: 'bold', color: 'var(--accent-light, #818cf8)', fontSize: '16px' }}>DevFlow AI</span>
         <button
           onClick={() => void handleLogout()}
           title="Logout"
@@ -3856,7 +3932,7 @@ function SidePanel() {
       </div>
 
       {/* Tab Bar */}
-      <div style={{ display: 'flex', background: '#1e293b', borderBottom: '1px solid #334155' }}>
+      <div style={{ display: 'flex', background: 'var(--bg-card, #1e293b)', borderBottom: '1px solid var(--bg-border, #334155)' }}>
         {tabs.map((tab) => (
           <button
             key={tab.id}
@@ -3868,8 +3944,8 @@ function SidePanel() {
               border: 'none',
               cursor: 'pointer',
               fontSize: '11px',
-              color: activeTab === tab.id ? '#818cf8' : '#64748b',
-              borderBottom: activeTab === tab.id ? '2px solid #818cf8' : '2px solid transparent',
+              color: activeTab === tab.id ? 'var(--accent-light, #818cf8)' : 'var(--text-muted, #64748b)',
+              borderBottom: activeTab === tab.id ? '2px solid var(--accent-light, #818cf8)' : '2px solid transparent',
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',

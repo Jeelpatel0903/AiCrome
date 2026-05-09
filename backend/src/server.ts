@@ -23,7 +23,14 @@ const server = Fastify({
 
 async function start() {
   await server.register(cors, {
-    origin: config.ALLOWED_ORIGINS,
+    origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
+      // Allow requests with no origin (server-to-server), any chrome-extension://, or explicitly listed origins
+      if (!origin || origin.startsWith('chrome-extension://') || config.ALLOWED_ORIGINS.includes(origin)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`CORS: origin '${origin}' not allowed`), false);
+      }
+    },
     credentials: true,
   });
 
@@ -38,6 +45,13 @@ async function start() {
     status: 'ok',
     timestamp: new Date().toISOString(),
     environment: config.NODE_ENV,
+  }));
+
+  // Agent config — lets the extension know which model is active and if key is set
+  server.get('/agent/config', async () => ({
+    model: process.env.AGENT_MODEL ?? 'claude-opus-4-7',
+    hasAnthropicKey: !!config.ANTHROPIC_API_KEY,
+    version: '1.0.0',
   }));
 
   await server.register(authRoutes, { prefix: '/auth' });
