@@ -6,7 +6,6 @@ import {
   GoogleAuthProvider,
   signInWithEmailAndPassword,
   signOut,
-  signInWithCredential,
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';

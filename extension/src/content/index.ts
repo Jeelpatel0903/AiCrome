@@ -1,6 +1,15 @@
 // Content script — injected into every page
 
+import { findElementByRef, buildSnapshot, buildSnapshotText, clearRefAttributes } from './snapshot';
+import type { PageSnapshot } from './snapshot';
+import { waitFor } from './wait';
+import type { WaitCondition } from './wait';
+import { findElementBySemanticLocator } from './semantic-locator';
+
 console.log('DevFlow AI content script loaded');
+
+// Module-level cache for the most recent page snapshot
+let lastSnapshot: PageSnapshot | null = null;
 
 interface ActionMessage {
   type: 'devflow_action';
@@ -183,6 +192,120 @@ async function handleAction(
         };
       };
       return { success: true, data: { dom: simplify(document.body) } };
+    }
+
+    case 'snapshot': {
+      clearRefAttributes();
+      const snapshot = buildSnapshot();
+      const prevSnapshot = lastSnapshot;
+      lastSnapshot = snapshot;
+      const snapshotText = buildSnapshotText(snapshot);
+      return {
+        success: true,
+        data: {
+          text: snapshotText,
+          elementCount: snapshot.elements.length,
+          url: snapshot.url,
+          fresh: prevSnapshot === null,
+        },
+      };
+    }
+
+    case 'get_snapshot': {
+      clearRefAttributes();
+      const snapshot = buildSnapshot();
+      lastSnapshot = snapshot;
+      // Cast PageSnapshot to a Record for the generic response data field
+      const snapshotData: Record<string, unknown> = {
+        url: snapshot.url,
+        title: snapshot.title,
+        timestamp: snapshot.timestamp,
+        elements: snapshot.elements,
+        scrollY: snapshot.scrollY,
+        pageHeight: snapshot.pageHeight,
+        viewportHeight: snapshot.viewportHeight,
+      };
+      return { success: true, data: snapshotData };
+    }
+
+    case 'click_ref': {
+      const ref = params.ref as string | undefined;
+      let el: Element | null = null;
+
+      if (ref) {
+        el = findElementByRef(ref);
+      }
+
+      if (!el && ref) {
+        // Fall back to semantic locator using the ref string as a name hint
+        const result = findElementBySemanticLocator({ name: ref });
+        el = result.element;
+      }
+
+      if (!el) {
+        return { success: false, error: `Element not found for ref: ${String(ref)}` };
+      }
+
+      (el as HTMLElement).click();
+      await new Promise<void>((r) => setTimeout(r, 500));
+      return { success: true, data: { clicked: el.tagName, ref: String(ref) } };
+    }
+
+    case 'type_ref': {
+      const ref = params.ref as string | undefined;
+      const fieldDescription = params.fieldDescription as string | undefined;
+      const text = params.text as string;
+      const clearFirst = params.clearFirst !== false;
+
+      let el: Element | null = null;
+
+      if (ref) {
+        el = findElementByRef(ref);
+      }
+
+      if (!el && fieldDescription) {
+        const result = findElementBySemanticLocator({ placeholder: fieldDescription });
+        el = result.element;
+      }
+
+      if (!el || !['INPUT', 'TEXTAREA'].includes(el.tagName)) {
+        return {
+          success: false,
+          error: `Input field not found for ref: ${String(ref ?? fieldDescription)}`,
+        };
+      }
+
+      const input = el as HTMLInputElement;
+      if (clearFirst) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+
+      input.focus();
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value',
+      )?.set;
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(input, text);
+      } else {
+        input.value = text;
+      }
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+
+      return { success: true, data: { typed: text, ref: String(ref ?? fieldDescription) } };
+    }
+
+    case 'wait': {
+      const condition = params.condition as WaitCondition;
+      const timeoutMs = typeof params.timeoutMs === 'number' ? params.timeoutMs : 25000;
+      const result = await waitFor(condition, timeoutMs);
+      return {
+        success: result.success,
+        data: { elapsed: result.elapsed },
+        error: result.error,
+      };
     }
 
     default:

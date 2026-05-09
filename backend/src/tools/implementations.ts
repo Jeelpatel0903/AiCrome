@@ -124,6 +124,107 @@ toolRegistry.register({
   },
 });
 
+// takeSnapshot — ref-based page intelligence
+toolRegistry.register({
+  name: 'takeSnapshot',
+  description:
+    'Get a structured snapshot of the current page with all interactive elements labeled (@e1, @e2, ...). ' +
+    'Always call this first before any interaction. Returns element refs you can use with clickRef/typeRef.',
+  category: 'observation',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+  async execute(_params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    return context.sendBridgeAction('snapshot', {});
+  },
+});
+
+// clickRef — ref-based click using snapshot element references
+toolRegistry.register({
+  name: 'clickRef',
+  description:
+    'Click an element by its ref from a snapshot (e.g. "@e3"). Always call takeSnapshot first to get refs.',
+  category: 'interaction',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ref: { type: 'string', description: 'Element ref from snapshot, e.g. "@e3" or "e3"' },
+    },
+    required: ['ref'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const ref = (params['ref'] as string).replace('@', '');
+    return context.sendBridgeAction('click_ref', { ref });
+  },
+});
+
+// typeRef — ref-based text input using snapshot element references
+toolRegistry.register({
+  name: 'typeRef',
+  description:
+    'Type text into an input field identified by its ref from a snapshot (e.g. "@e5"). ' +
+    'Use takeSnapshot first to identify the correct field ref.',
+  category: 'interaction',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ref: { type: 'string', description: 'Element ref from snapshot, e.g. "@e5" or "e5"' },
+      text: { type: 'string', description: 'Text to type into the field' },
+      clearFirst: {
+        type: 'boolean',
+        description: 'Clear existing value before typing (default: true)',
+      },
+    },
+    required: ['ref', 'text'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const ref = (params['ref'] as string).replace('@', '');
+    const text = params['text'] as string;
+    const clearFirst = params['clearFirst'] !== false;
+    return context.sendBridgeAction('type_ref', { ref, text, clearFirst });
+  },
+});
+
+// waitForCondition — polling wait strategies
+toolRegistry.register({
+  name: 'waitForCondition',
+  description:
+    'Wait for a page condition before continuing. Useful after navigation, form submission, or animations.',
+  category: 'navigation',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      conditionType: {
+        type: 'string',
+        enum: ['element-visible', 'element-gone', 'text-present', 'url-contains', 'network-idle', 'delay'],
+        description: 'Type of condition to wait for',
+      },
+      ref: { type: 'string', description: 'Element ref for element-visible/element-gone conditions' },
+      text: { type: 'string', description: 'Text to look for (text-present condition)' },
+      substring: { type: 'string', description: 'URL substring (url-contains condition)' },
+      ms: { type: 'number', description: 'Milliseconds (delay condition)' },
+      timeoutMs: { type: 'number', description: 'Max wait time in ms (default: 25000)' },
+    },
+    required: ['conditionType'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const condition: Record<string, unknown> = {
+      type: params['conditionType'],
+    };
+    if (params['ref']) condition['ref'] = (params['ref'] as string).replace('@', '');
+    if (params['text']) condition['text'] = params['text'];
+    if (params['substring']) condition['substring'] = params['substring'];
+    if (params['ms']) condition['ms'] = params['ms'];
+
+    return context.sendBridgeAction('wait', {
+      condition,
+      timeoutMs: params['timeoutMs'] ?? 25000,
+    });
+  },
+});
+
 // clickElement
 toolRegistry.register({
   name: 'clickElement',

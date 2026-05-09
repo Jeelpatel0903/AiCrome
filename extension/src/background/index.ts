@@ -174,7 +174,7 @@ chrome.action.onClicked.addListener((tab) => {
 // Listen for auth state changes from sidepanel
 chrome.runtime.onMessage.addListener(
   (
-    message: { type: string; userId?: string; token?: string },
+    message: { type: string; userId?: string; token?: string; url?: string },
     _sender,
     sendResponse,
   ) => {
@@ -193,6 +193,21 @@ chrome.runtime.onMessage.addListener(
         connected: ws?.readyState === WebSocket.OPEN,
         userId,
       });
+    } else if (message.type === 'take_screenshot') {
+      chrome.tabs.captureVisibleTab({ format: 'png' }, (dataUrl) => {
+        sendResponse({ success: true, dataUrl });
+      });
+      return true; // async
+    } else if (message.type === 'devflow_navigate' && message.url) {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]?.id) {
+          chrome.tabs.update(tabs[0].id, { url: message.url as string });
+          sendResponse({ success: true });
+        } else {
+          sendResponse({ success: false, error: 'No active tab' });
+        }
+      });
+      return true; // async
     }
     return true;
   },

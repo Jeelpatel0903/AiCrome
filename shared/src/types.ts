@@ -219,7 +219,7 @@ export interface UserSettings {
   progressNotifications: boolean;
 }
 
-// ==================== AI CONFIG ====================
+// ==================== AI CONFIG =============
 
 export type AIProvider = 'anthropic' | 'openai' | 'deepseek';
 
@@ -274,4 +274,101 @@ export interface AIConfigPublic {
   hasKey: boolean;
   source: 'db' | 'env';
   enabled: boolean;
+}
+
+// ==================== SNAPSHOT + REFS ====================
+export interface ElementRef {
+  ref: string;
+  tag: string;
+  role: string;
+  name: string;
+  type?: string;
+  value?: string;
+  disabled: boolean;
+  visible: boolean;
+  boundingBox: { x: number; y: number; width: number; height: number };
+  cssSelector: string;
+  xpath: string;
+}
+
+export interface PageSnapshot {
+  url: string;
+  title: string;
+  timestamp: string;
+  elements: ElementRef[];
+  scrollY: number;
+  pageHeight: number;
+  viewportHeight: number;
+}
+
+// ==================== ACTION POLICY ====================
+export type ActionRisk = 'safe' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface ActionPolicy {
+  action: string;
+  risk: ActionRisk;
+  reason: string;
+  requiresConfirmation: boolean;
+  params?: Record<string, unknown>;
+}
+
+export type BrowserAction =
+  | { type: 'click'; ref: string }
+  | { type: 'type'; ref: string; text: string }
+  | { type: 'navigate'; url: string }
+  | { type: 'select'; ref: string; option: string }
+  | { type: 'pressKey'; key: string }
+  | { type: 'scroll'; direction: 'up' | 'down'; amount?: number }
+  | { type: 'wait'; condition: Record<string, unknown> }
+  | { type: 'snapshot' }
+  | { type: 'screenshot' };
+
+export function classifyActionRisk(action: BrowserAction): ActionRisk {
+  switch (action.type) {
+    case 'snapshot':
+    case 'screenshot':
+      return 'safe';
+    case 'scroll':
+      return 'safe';
+    case 'type':
+      return 'low';
+    case 'click':
+      return 'low';
+    case 'pressKey':
+      return action.key === 'Enter' || action.key === 'Return' ? 'medium' : 'low';
+    case 'navigate': {
+      const url = action.url.toLowerCase();
+      if (url.includes('delete') || url.includes('remove') || url.includes('cancel')) return 'high';
+      return 'medium';
+    }
+    case 'select':
+      return 'low';
+    case 'wait':
+      return 'safe';
+    default:
+      return 'medium';
+  }
+}
+
+// ==================== BATCH EXECUTION ====================
+export interface BatchCommand {
+  actions: BrowserAction[];
+  bail: boolean;  // stop on first failure
+}
+
+export interface BatchResult {
+  results: Array<{ action: BrowserAction; success: boolean; data?: Record<string, unknown>; error?: string }>;
+  allSucceeded: boolean;
+  stoppedEarly: boolean;
+}
+
+// ==================== DOMAIN GUARD ====================
+export interface DomainRule {
+  pattern: string;  // "*.example.com" or "example.com" or "*"
+  action: 'allow' | 'block';
+}
+
+export interface DomainGuardConfig {
+  rules: DomainRule[];
+  defaultAction: 'allow' | 'block';
 }

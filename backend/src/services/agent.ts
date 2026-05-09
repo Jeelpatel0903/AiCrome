@@ -1,39 +1,57 @@
 import { toolRegistry } from '../tools/registry';
 import { getActiveAIConfig, AIProviderFactory } from './ai-provider';
+import { BOUNDARY_SYSTEM_INSTRUCTION } from './content-boundary.service';
 
-const SYSTEM_PROMPT = `You are DevFlow AI, an intelligent browser automation assistant. You help users automate repetitive tasks in their web browsers.
+const SYSTEM_PROMPT = `You are DevFlow AI, an intelligent browser automation assistant.
 
-## Core Behavior
-1. ALWAYS start by calling readMemory with the current URL and task description to load relevant context
-2. ALWAYS call getSitePrefs before filling any form
-3. After EVERY browser action (click, type, navigate), call takeScreenshot to verify the result
-4. Send progress updates frequently using sendProgress so the user knows what you're doing
-5. When a task is complete, call taskComplete with a clear summary
+${BOUNDARY_SYSTEM_INSTRUCTION}
+
+## Core Loop
+For every task, follow this exact loop:
+1. Call \`takeSnapshot\` to get the current page state with element refs (@e1, @e2, ...)
+2. Identify which elements to interact with by their ref (e.g., @e3)
+3. Check action risk before acting — high/critical risk actions need careful consideration
+4. Execute actions using refs: click_ref(@e3), type_ref(@e5, "text")
+5. After EVERY action, call \`takeSnapshot\` again to verify the result
+6. When done, call \`taskComplete\` with a summary
+
+## Element References
+- Use @eN refs from the snapshot (e.g., @e1, @e2, @e15)
+- Refs are stable within a page load but change after navigation
+- Always re-snapshot after navigation before using refs
+
+## Commands (JSON format)
+When you want to execute a browser action, respond with a JSON block:
+\`\`\`json
+{"action": "click_ref", "ref": "@e3"}
+{"action": "type_ref", "ref": "@e7", "text": "hello@example.com"}
+{"action": "navigate", "url": "https://example.com"}
+{"action": "wait", "condition": {"type": "element-visible", "ref": "@e5"}}
+{"action": "snapshot"}
+{"action": "screenshot"}
+\`\`\`
 
 ## Language
 - Respond in the same language the user uses (Hinglish, English, Hindi)
-- Keep messages friendly and informative
-- Use simple, clear language
+- Keep progress messages friendly and informative
 
 ## Memory Rules
 - When user says "yaad rakhlo" or "remember" → call writeMemory immediately
-- When user provides account details or preferences → save to memory
+- When user provides account details → save to memory
 - When user gives a rule → save as type 'rule'
 
 ## Form Filling Rules
 - Get site preferences first (getSitePrefs)
 - Apply defaults from preferences
-- Check command for override keywords matching overrideRules
-- Use addFormRow for dynamic forms that need multiple rows
+- Check command for override keywords
 
 ## Error Handling
-- If an action fails, try once more with a different approach
-- After 2 failures, inform the user with sendProgress and stop
-- Never silently fail
+- If an action fails, re-snapshot and try alternative element
+- After 2 failures on same step, inform user and stop
+- Never silently fail — always sendProgress
 
-## Identity Rules
-- When user says "login as [name]" → call getIdentity with that name
-- Use returned credentials to fill login form`;
+## Identity
+- When user says "login as [name]" → call getIdentity with that name`;
 
 export interface AgentSession {
   sessionId: string;
@@ -94,7 +112,9 @@ export async function runAgent(params: {
   const messages: unknown[] = [
     {
       role: 'user',
-      content: currentUrl ? `Current URL: ${currentUrl}\n\nTask: ${command}` : command,
+      content: currentUrl
+        ? `Task: ${command}\n\nBrowser is currently at: ${currentUrl}\n\nStart by calling takeSnapshot to see the current page state.`
+        : `Task: ${command}\n\nStart by calling takeSnapshot to see the current page state.`,
     },
   ];
 

@@ -159,8 +159,9 @@ class OpenAIProviderClient implements AIProviderClient {
       finishReason === 'tool_calls' ? 'tool_calls' : 'end_turn';
 
     type FunctionToolCall = { id: string; type: 'function'; function: { name: string; arguments: string } };
-    const toolCalls: NormalizedToolCall[] = (choice.message.tool_calls ?? [])
-      .filter((tc): tc is FunctionToolCall => tc.type === 'function')
+    const rawToolCalls: unknown[] = choice.message.tool_calls ?? [];
+    const toolCalls: NormalizedToolCall[] = rawToolCalls
+      .filter((tc): tc is FunctionToolCall => (tc as FunctionToolCall).type === 'function')
       .map((tc) => ({
         id: tc.id,
         name: tc.function.name,
