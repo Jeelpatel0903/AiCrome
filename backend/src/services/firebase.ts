@@ -16,5 +16,8 @@ if (!admin.apps.length) {
   });
 }
 
-export const db = admin.firestore();
+const firestoreDb = admin.firestore();
+firestoreDb.settings({ ignoreUndefinedProperties: true });
+
+export const db = firestoreDb;
 export const auth = admin.auth();

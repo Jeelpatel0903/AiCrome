@@ -46,7 +46,16 @@ interface AnthropicTool {
   input_schema: ToolDefinition['inputSchema'];
 }
 
-class ToolRegistry {
+interface OpenAITool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: ToolDefinition['inputSchema'];
+  };
+}
+
+export class ToolRegistry {
   private tools: Map<string, ToolDefinition> = new Map();
 
   register(tool: ToolDefinition): void {
@@ -67,6 +76,18 @@ class ToolRegistry {
       name: tool.name,
       description: tool.description,
       input_schema: tool.inputSchema,
+    }));
+  }
+
+  // Convert to OpenAI / DeepSeek tool format (function-calling schema)
+  toOpenAITools(): OpenAITool[] {
+    return this.getAll().map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      },
     }));
   }
 

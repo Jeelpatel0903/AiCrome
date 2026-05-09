@@ -3,6 +3,7 @@
 let ws: WebSocket | null = null;
 let userId: string | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectDelay = 2000; // exponential backoff: 2s → 4s → 8s → … → 60s
 
 // Declare VITE_BACKEND_URL as it's injected by Vite
 declare const VITE_BACKEND_URL: string;
@@ -19,19 +20,22 @@ function connectWebSocket(uid: string, token: string) {
 
   ws.onopen = () => {
     console.log('DevFlow AI: WebSocket connected');
+    reconnectDelay = 2000; // reset backoff on successful connection
     if (reconnectTimer) clearTimeout(reconnectTimer);
   };
 
   ws.onclose = () => {
-    console.log('DevFlow AI: WebSocket disconnected, reconnecting in 5s...');
     ws = null;
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+    console.log(`DevFlow AI: WebSocket disconnected, retrying in ${delay / 1000}s...`);
     reconnectTimer = setTimeout(() => {
       chrome.storage.local.get(['userId', 'authToken'], (result) => {
         if (result.userId && result.authToken) {
           connectWebSocket(result.userId as string, result.authToken as string);
         }
       });
-    }, 5000);
+    }, delay);
   };
 
   ws.onerror = (err) => {
@@ -48,7 +52,10 @@ function connectWebSocket(uid: string, token: string) {
       };
 
       // Forward progress messages to sidepanel
-      chrome.runtime.sendMessage({ ...msg, type: 'progress_update' }).catch(() => {
+      // Preserve the original server `type` as `type_` so the sidepanel can
+      // distinguish 'complete' / 'error' / 'tool_start' etc., while `type`
+      // stays 'progress_update' so the sidepanel listener fires.
+      chrome.runtime.sendMessage({ ...msg, type_: msg.type, type: 'progress_update' }).catch(() => {
         // Sidepanel might not be open
       });
 

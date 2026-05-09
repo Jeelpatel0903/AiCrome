@@ -10,7 +10,8 @@ import {
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
-import type { IdentityPublic, Memory, MemoryType } from '../../../shared/src/types';
+import type { IdentityPublic, Memory, MemoryType, AIProvider, AIConfigPublic } from '../../../shared/src/types';
+import { PROVIDER_MODELS } from '../../../shared/src/types';
 
 type Tab = 'agent' | 'memory' | 'vault' | 'flows' | 'schedule' | 'settings';
 
@@ -1726,17 +1727,20 @@ function AgentTab({ token }: AgentTabProps) {
 
     const currentUrl = await getCurrentUrl();
 
-    // Create new session entry
-    const tempId = 'session-' + Date.now().toString(36);
+    // Generate sessionId on the frontend so WebSocket messages can be matched
+    // immediately — avoids a race condition where progress arrives before the
+    // HTTP response and is silently dropped.
+    const sessionId = crypto.randomUUID();
     const newSession: SessionEntry = {
-      sessionId: tempId,
+      sessionId,
       command: cmd,
       messages: [{ type: 'user', message: cmd, timestamp: new Date().toISOString() }],
       status: 'running',
       startedAt: new Date().toISOString(),
     };
     setSessions((prev) => [...prev, newSession]);
-    setActiveSessionId(tempId);
+    setActiveSessionId(sessionId);
+    setCurrentSessionId(sessionId);
 
     try {
       const res = await fetch(`${backendUrl}/agent/run`, {
@@ -1745,7 +1749,8 @@ function AgentTab({ token }: AgentTabProps) {
           Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ command: cmd, currentUrl }),
+        // Pass sessionId so backend uses the same ID we already have
+        body: JSON.stringify({ command: cmd, currentUrl, sessionId }),
       });
       const json = (await res.json()) as {
         success: boolean;
@@ -1755,22 +1760,12 @@ function AgentTab({ token }: AgentTabProps) {
       if (!json.success) {
         throw new Error(json.error ?? 'Failed to start agent');
       }
-      if (json.sessionId) {
-        // Update temp session ID with real session ID
-        setSessions((prev) =>
-          prev.map((s) => (s.sessionId === tempId ? { ...s, sessionId: json.sessionId! } : s)),
-        );
-        setActiveSessionId(json.sessionId);
-        setCurrentSessionId(json.sessionId);
-      } else {
-        setCurrentSessionId(tempId);
-      }
     } catch (err: unknown) {
       const e = err as { message?: string };
       setRunError(e.message ?? 'Failed to start agent');
       setIsRunning(false);
       setSessions((prev) =>
-        prev.map((s) => (s.sessionId === tempId ? { ...s, status: 'error' } : s)),
+        prev.map((s) => (s.sessionId === sessionId ? { ...s, status: 'error' } : s)),
       );
     }
   };
@@ -3474,16 +3469,24 @@ function SettingsTab({ token }: SettingsTabProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [agentModel, setAgentModel] = useState('claude-opus-4-7');
-  const [agentKeyOk, setAgentKeyOk] = useState<boolean | null>(null);
+
+  // AI Config state
+  const [aiConfig, setAiConfig] = useState<AIConfigPublic | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<AIProvider>('anthropic');
+  const [selectedModel, setSelectedModel] = useState('claude-sonnet-4-5');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [aiSaving, setAiSaving] = useState(false);
+  const [aiSaved, setAiSaved] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   useEffect(() => {
     const load = async () => {
       setLoading(true);
       try {
-        const [meRes, cfgRes] = await Promise.all([
+        const [meRes, aiCfgRes] = await Promise.all([
           fetch(`${backendUrl}/auth/me`, { headers: { Authorization: `Bearer ${token}` } }),
-          fetch(`${backendUrl}/agent/config`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null),
+          fetch(`${backendUrl}/ai-config`, { headers: { Authorization: `Bearer ${token}` } }).catch(() => null),
         ]);
         const meData = (await meRes.json()) as {
           success: boolean;
@@ -3498,10 +3501,13 @@ function SettingsTab({ token }: SettingsTabProps) {
             chrome.storage.local.set({ theme: s.theme });
           }
         }
-        if (cfgRes?.ok) {
-          const cfgData = (await cfgRes.json()) as { model: string; hasAnthropicKey: boolean };
-          setAgentModel(cfgData.model);
-          setAgentKeyOk(cfgData.hasAnthropicKey);
+        if (aiCfgRes?.ok) {
+          const aiCfgData = (await aiCfgRes.json()) as { success: boolean; data?: AIConfigPublic };
+          if (aiCfgData.data) {
+            setAiConfig(aiCfgData.data);
+            setSelectedProvider(aiCfgData.data.provider);
+            setSelectedModel(aiCfgData.data.model);
+          }
         }
       } catch {
         // use defaults
@@ -3535,6 +3541,47 @@ function SettingsTab({ token }: SettingsTabProps) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSaveAiConfig = async () => {
+    if (!apiKeyInput.trim()) {
+      setAiError('API key is required');
+      return;
+    }
+    setAiSaving(true);
+    setAiError(null);
+    try {
+      const res = await fetch(`${backendUrl}/ai-config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ provider: selectedProvider, model: selectedModel, apiKey: apiKeyInput }),
+      });
+      if (res.ok) {
+        setApiKeyInput('');
+        const updated = await fetch(`${backendUrl}/ai-config`, { headers: { Authorization: `Bearer ${token}` } });
+        if (updated.ok) {
+          const d = (await updated.json()) as { data?: AIConfigPublic };
+          if (d.data) { setAiConfig(d.data); setSelectedProvider(d.data.provider); setSelectedModel(d.data.model); }
+        }
+        setAiSaved(true);
+        setTimeout(() => setAiSaved(false), 2000);
+      } else {
+        const err = (await res.json()) as { error?: string };
+        setAiError(err.error ?? 'Failed to save AI config');
+      }
+    } catch { setAiError('Network error'); }
+    finally { setAiSaving(false); }
+  };
+
+  const handleResetAiConfig = async () => {
+    try {
+      await fetch(`${backendUrl}/ai-config`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+      setAiConfig(null);
+      setSelectedProvider('anthropic');
+      setSelectedModel('claude-sonnet-4-5');
+      setApiKeyInput('');
+      setAiError(null);
+    } catch { /* ignore */ }
   };
 
   const Toggle = ({
@@ -3742,30 +3789,104 @@ function SettingsTab({ token }: SettingsTabProps) {
         />
       </div>
 
-      {/* AI Agent Configuration */}
-      <div style={{ margin: '20px 0 8px', fontSize: '11px', fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-        AI Agent
-      </div>
-      <div style={{ background: '#1e293b', borderRadius: '8px', padding: '12px', border: '1px solid #334155' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-          <span style={{ color: '#e2e8f0', fontSize: '13px' }}>Anthropic API Key</span>
+      {/* AI Configuration */}
+      <p style={sectionHeaderStyle}>AI Configuration</p>
+
+      <div style={{ background: '#1e293b', borderRadius: '8px', padding: '14px', border: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+
+        {/* Status badge */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span style={{ color: '#94a3b8', fontSize: '11px' }}>Active config</span>
           <span style={{
-            background: agentKeyOk === null ? '#334155' : agentKeyOk ? '#064e3b' : '#7f1d1d',
-            color: agentKeyOk === null ? '#94a3b8' : agentKeyOk ? '#6ee7b7' : '#fca5a5',
-            padding: '2px 8px', borderRadius: '10px', fontSize: '11px',
+            background: aiConfig?.source === 'db' ? '#064e3b' : '#1e3a5f',
+            color: aiConfig?.source === 'db' ? '#6ee7b7' : '#93c5fd',
+            padding: '2px 8px', borderRadius: '10px', fontSize: '11px', fontWeight: 600,
           }}>
-            {agentKeyOk === null ? 'Checking…' : agentKeyOk ? '✓ Configured' : '✗ Missing'}
+            {aiConfig?.source === 'db'
+              ? `✓ ${PROVIDER_MODELS[aiConfig.provider]?.label ?? aiConfig.provider} · ${aiConfig.model}`
+              : `ENV · ${aiConfig?.model ?? 'claude-sonnet-4-5'}`}
           </span>
         </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ color: '#e2e8f0', fontSize: '13px' }}>Active Model</span>
-          <span style={{ color: '#818cf8', fontSize: '12px', fontFamily: 'monospace' }}>{agentModel}</span>
+
+        {/* Provider selector */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <label style={{ color: '#94a3b8', fontSize: '11px' }}>Provider</label>
+          <select
+            value={selectedProvider}
+            onChange={(e) => {
+              const p = e.target.value as AIProvider;
+              setSelectedProvider(p);
+              setSelectedModel(PROVIDER_MODELS[p].models[0]?.id ?? '');
+            }}
+            style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: '6px', padding: '7px 10px', fontSize: '13px', width: '100%' }}
+          >
+            {(Object.keys(PROVIDER_MODELS) as AIProvider[]).map((p) => (
+              <option key={p} value={p}>{PROVIDER_MODELS[p].label}</option>
+            ))}
+          </select>
         </div>
-        {!agentKeyOk && agentKeyOk !== null && (
-          <p style={{ color: '#f87171', fontSize: '11px', marginTop: '8px' }}>
-            Set ANTHROPIC_API_KEY in backend/.env to enable the AI agent.
-          </p>
-        )}
+
+        {/* Model selector */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <label style={{ color: '#94a3b8', fontSize: '11px' }}>Model</label>
+          <select
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+            style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: '6px', padding: '7px 10px', fontSize: '13px', width: '100%' }}
+          >
+            {PROVIDER_MODELS[selectedProvider].models.map((m) => (
+              <option key={m.id} value={m.id}>{m.label}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* API Key input */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <label style={{ color: '#94a3b8', fontSize: '11px' }}>
+            API Key {aiConfig?.hasKey && aiConfig.source === 'db' && <span style={{ color: '#6ee7b7' }}>· key saved</span>}
+          </label>
+          <div style={{ position: 'relative', display: 'flex' }}>
+            <input
+              type={showApiKey ? 'text' : 'password'}
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              placeholder={aiConfig?.hasKey && aiConfig.source === 'db' ? '••••••• (leave blank to keep current)' : 'Enter API key…'}
+              style={{ flex: 1, background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: '6px', padding: '7px 36px 7px 10px', fontSize: '12px', outline: 'none' }}
+            />
+            <button
+              onClick={() => setShowApiKey((v) => !v)}
+              style={{ position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: '14px', padding: 0 }}
+              title={showApiKey ? 'Hide key' : 'Show key'}
+            >
+              {showApiKey ? '🙈' : '👁'}
+            </button>
+          </div>
+        </div>
+
+        {aiError && <p style={{ color: '#f87171', fontSize: '11px', margin: 0 }}>{aiError}</p>}
+
+        {/* Action buttons */}
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            onClick={() => void handleSaveAiConfig()}
+            disabled={aiSaving}
+            style={{ flex: 1, background: aiSaving ? '#374151' : '#6366f1', border: 'none', borderRadius: '6px', padding: '8px 12px', color: 'white', fontSize: '12px', fontWeight: 600, cursor: aiSaving ? 'not-allowed' : 'pointer', opacity: aiSaving ? 0.7 : 1 }}
+          >
+            {aiSaving ? 'Saving…' : aiSaved ? '✓ Saved!' : 'Save AI Config'}
+          </button>
+          {aiConfig?.source === 'db' && (
+            <button
+              onClick={() => void handleResetAiConfig()}
+              style={{ background: 'transparent', border: '1px solid #334155', borderRadius: '6px', padding: '8px 12px', color: '#94a3b8', fontSize: '12px', cursor: 'pointer' }}
+              title="Remove DB config and revert to env var"
+            >
+              Reset
+            </button>
+          )}
+        </div>
+        <p style={{ color: '#475569', fontSize: '10px', margin: 0, lineHeight: 1.5 }}>
+          Switching provider takes effect on the next agent run. Keys are encrypted before storage.
+        </p>
       </div>
 
       <button
@@ -3798,6 +3919,30 @@ function applyTheme(theme: string) {
   const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const effective = theme === 'system' ? (systemDark ? 'dark' : 'light') : theme;
   document.documentElement.setAttribute('data-theme', effective);
+}
+
+function TabOfflineScreen() {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+      justifyContent: 'center', height: '100%', padding: '32px 16px', textAlign: 'center',
+    }}>
+      <div style={{ fontSize: '48px', marginBottom: '16px' }}>🔌</div>
+      <p style={{ color: '#e2e8f0', fontSize: '14px', fontWeight: 600, marginBottom: '8px' }}>
+        Backend server is not running
+      </p>
+      <p style={{ color: '#64748b', fontSize: '12px', marginBottom: '20px', lineHeight: 1.6 }}>
+        Start the backend server on your machine, then reload the extension panel.
+      </p>
+      <code style={{
+        background: '#1e293b', border: '1px solid #334155', borderRadius: '6px',
+        padding: '10px 14px', fontSize: '12px', color: '#818cf8',
+        userSelect: 'all', display: 'block', width: '100%', cursor: 'text',
+      }}>
+        npm run dev -w @devflow/backend
+      </code>
+    </div>
+  );
 }
 
 function SidePanel() {
@@ -3969,11 +4114,11 @@ function SidePanel() {
           flexDirection: 'column',
         }}
       >
-        {activeTab === 'agent' && token && <AgentTab token={token} />}
-        {activeTab === 'memory' && token && <MemoryTab token={token} />}
-        {activeTab === 'vault' && token && <VaultTab token={token} />}
-        {activeTab === 'flows' && token && <FlowsTab token={token} />}
-        {activeTab === 'schedule' && token && <ScheduleTab token={token} />}
+        {activeTab === 'agent'    && token && (backendOnline === false ? <TabOfflineScreen /> : <AgentTab token={token} />)}
+        {activeTab === 'memory'   && token && (backendOnline === false ? <TabOfflineScreen /> : <MemoryTab token={token} />)}
+        {activeTab === 'vault'    && token && (backendOnline === false ? <TabOfflineScreen /> : <VaultTab token={token} />)}
+        {activeTab === 'flows'    && token && (backendOnline === false ? <TabOfflineScreen /> : <FlowsTab token={token} />)}
+        {activeTab === 'schedule' && token && (backendOnline === false ? <TabOfflineScreen /> : <ScheduleTab token={token} />)}
         {activeTab === 'settings' && token && <SettingsTab token={token} />}
       </div>
     </div>

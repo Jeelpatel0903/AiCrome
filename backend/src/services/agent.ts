@@ -1,8 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { toolRegistry } from '../tools/registry';
-import { config } from '../config';
-
-const anthropic = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+import { getActiveAIConfig, AIProviderFactory } from './ai-provider';
 
 const SYSTEM_PROMPT = `You are DevFlow AI, an intelligent browser automation assistant. You help users automate repetitive tasks in their web browsers.
 
@@ -88,7 +85,13 @@ export async function runAgent(params: {
     sendBridgeAction,
   };
 
-  const messages: Anthropic.MessageParam[] = [
+  // Resolve AI provider config once per agent run (avoids per-iteration DB reads)
+  const aiConfig = await getActiveAIConfig(userId);
+  const providerClient = AIProviderFactory.create(aiConfig);
+  const tools = providerClient.getTools(toolRegistry);
+
+  // Provider-agnostic message history
+  const messages: unknown[] = [
     {
       role: 'user',
       content: currentUrl ? `Current URL: ${currentUrl}\n\nTask: ${command}` : command,
@@ -110,63 +113,47 @@ export async function runAgent(params: {
         break;
       }
 
-      const response = await anthropic.messages.create({
-        model: (process.env.AGENT_MODEL ?? 'claude-opus-4-7') as Anthropic.Model,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        tools: toolRegistry.toAnthropicTools() as Anthropic.Tool[],
+      const response = await providerClient.chat({
         messages,
+        tools,
+        systemPrompt: SYSTEM_PROMPT,
+        maxTokens: 4096,
+        model: aiConfig.model,
       });
 
-      // Add assistant response to history
-      messages.push({ role: 'assistant', content: response.content });
+      // Add assistant response to history (provider-specific format)
+      messages.push(response.rawAssistantMessage);
 
-      if (response.stop_reason === 'end_turn') {
-        // Extract text response
-        const textBlock = response.content.find((b) => b.type === 'text');
-        if (textBlock && textBlock.type === 'text') {
-          await sendProgress('message', textBlock.text);
+      if (response.stopReason === 'end_turn') {
+        if (response.textContent) {
+          await sendProgress('message', response.textContent);
         }
         session.status = 'completed';
         break;
       }
 
-      if (response.stop_reason === 'tool_use') {
-        const toolUseBlocks = response.content.filter((b) => b.type === 'tool_use');
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      if (response.stopReason === 'tool_calls') {
+        for (const toolCall of response.toolCalls) {
+          await sendProgress('tool_start', `⚙️ ${toolCall.name}...`);
 
-        for (const block of toolUseBlocks) {
-          if (block.type !== 'tool_use') continue;
-
-          await sendProgress('tool_start', `⚙️ ${block.name}...`);
-
-          const result = await toolRegistry.execute(
-            block.name,
-            block.input as Record<string, unknown>,
-            toolContext,
-          );
+          const result = await toolRegistry.execute(toolCall.name, toolCall.input, toolContext);
 
           if (result.success) {
-            await sendProgress('tool_success', `✅ ${block.name} completed`);
+            await sendProgress('tool_success', `✅ ${toolCall.name} completed`);
           } else {
-            await sendProgress('tool_error', `❌ ${block.name} failed: ${result.error}`);
+            await sendProgress('tool_error', `❌ ${toolCall.name} failed: ${result.error}`);
           }
 
-          toolResults.push({
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: JSON.stringify(result),
-          });
+          // Push tool result in the format this provider expects
+          messages.push(providerClient.formatToolResult(toolCall.id, result));
 
-          // Stop processing tools if task was marked complete
-          if (block.name === 'taskComplete') {
+          // Stop processing if task was marked complete
+          if (toolCall.name === 'taskComplete') {
             session.status = 'completed';
             activeSessions.delete(sessionId);
             return;
           }
         }
-
-        messages.push({ role: 'user', content: toolResults });
       }
     }
 
