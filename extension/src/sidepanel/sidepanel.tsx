@@ -3800,6 +3800,30 @@ function applyTheme(theme: string) {
   document.documentElement.setAttribute('data-theme', effective);
 }
 
+function TabOfflineScreen() {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+      justifyContent: 'center', height: '100%', padding: '32px 16px', textAlign: 'center',
+    }}>
+      <div style={{ fontSize: '48px', marginBottom: '16px' }}>🔌</div>
+      <p style={{ color: '#e2e8f0', fontSize: '14px', fontWeight: 600, marginBottom: '8px' }}>
+        Backend server is not running
+      </p>
+      <p style={{ color: '#64748b', fontSize: '12px', marginBottom: '20px', lineHeight: 1.6 }}>
+        Start the backend server on your machine, then reload the extension panel.
+      </p>
+      <code style={{
+        background: '#1e293b', border: '1px solid #334155', borderRadius: '6px',
+        padding: '10px 14px', fontSize: '12px', color: '#818cf8',
+        userSelect: 'all', display: 'block', width: '100%', cursor: 'text',
+      }}>
+        npm run dev -w @devflow/backend
+      </code>
+    </div>
+  );
+}
+
 function SidePanel() {
   const { user, token, isLoading, setUser, setToken, setLoading } = useAuthStore();
   const [activeTab, setActiveTab] = useState<Tab>('agent');
@@ -3969,11 +3993,11 @@ function SidePanel() {
           flexDirection: 'column',
         }}
       >
-        {activeTab === 'agent' && token && <AgentTab token={token} />}
-        {activeTab === 'memory' && token && <MemoryTab token={token} />}
-        {activeTab === 'vault' && token && <VaultTab token={token} />}
-        {activeTab === 'flows' && token && <FlowsTab token={token} />}
-        {activeTab === 'schedule' && token && <ScheduleTab token={token} />}
+        {activeTab === 'agent'    && token && (backendOnline === false ? <TabOfflineScreen /> : <AgentTab token={token} />)}
+        {activeTab === 'memory'   && token && (backendOnline === false ? <TabOfflineScreen /> : <MemoryTab token={token} />)}
+        {activeTab === 'vault'    && token && (backendOnline === false ? <TabOfflineScreen /> : <VaultTab token={token} />)}
+        {activeTab === 'flows'    && token && (backendOnline === false ? <TabOfflineScreen /> : <FlowsTab token={token} />)}
+        {activeTab === 'schedule' && token && (backendOnline === false ? <TabOfflineScreen /> : <ScheduleTab token={token} />)}
         {activeTab === 'settings' && token && <SettingsTab token={token} />}
       </div>
     </div>
