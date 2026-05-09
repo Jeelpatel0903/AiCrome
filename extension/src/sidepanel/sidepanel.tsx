@@ -6,6 +6,7 @@ import {
   GoogleAuthProvider,
   signInWithEmailAndPassword,
   signOut,
+  signInWithCredential,
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
@@ -37,11 +38,31 @@ function LoginScreen() {
     setLoading(true);
     setError(null);
     try {
-      await signInWithPopup(auth, new GoogleAuthProvider());
+      if (typeof chrome !== 'undefined' && chrome.identity) {
+        chrome.identity.getAuthToken({ interactive: true }, async (token) => {
+          if (chrome.runtime.lastError || !token) {
+            setError(chrome.runtime.lastError?.message || 'Failed to get auth token');
+            setLoading(false);
+            return;
+          }
+          try {
+            const credential = GoogleAuthProvider.credential(null, token);
+            await signInWithCredential(auth, credential);
+          } catch (err: unknown) {
+            const e = err as { message?: string };
+            setError(e.message ?? 'Google sign-in failed');
+          } finally {
+            setLoading(false);
+          }
+        });
+      } else {
+        // Fallback for non-extension environment
+        await signInWithPopup(auth, new GoogleAuthProvider());
+        setLoading(false);
+      }
     } catch (err: unknown) {
       const e = err as { message?: string };
       setError(e.message ?? 'Google sign-in failed');
-    } finally {
       setLoading(false);
     }
   };

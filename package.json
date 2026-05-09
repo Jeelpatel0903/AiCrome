@@ -2,7 +2,11 @@
   "name": "devflow-ai",
   "version": "1.0.0",
   "private": true,
-  "workspaces": ["extension", "backend", "shared"],
+  "workspaces": [
+    "extension",
+    "backend",
+    "shared"
+  ],
   "scripts": {
     "dev:extension": "npm run dev --workspace=extension",
     "dev:backend": "npm run dev --workspace=backend",
@@ -14,5 +18,8 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "firebase": "^12.13.0"
   }
 }
