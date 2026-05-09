@@ -9,6 +9,10 @@ import {
 } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuthStore } from '../store/auth';
+import { useActivityStore } from '../store/activity.store';
+import { ActivityLog } from './ActivityLog';
+import { ActionConfirmation } from './ActionConfirmation';
+import type { PendingConfirmation } from './ActionConfirmation';
 import type { IdentityPublic, Memory, MemoryType, AIProvider, AIConfigPublic } from '../../../shared/src/types';
 import { PROVIDER_MODELS } from '../../../shared/src/types';
 
@@ -1613,6 +1617,10 @@ function AgentTab({ token }: AgentTabProps) {
   const [isRunning, setIsRunning] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [showActivityLog, setShowActivityLog] = useState(false);
+  const addActivity = useActivityStore((s) => s.addEntry);
+  const updateActivity = useActivityStore((s) => s.updateEntry);
+  const lastActivityId = useRef<string | null>(null);
   const [showPrevSessions, setShowPrevSessions] = useState(false);
   const [isListening, setIsListening] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1701,6 +1709,37 @@ function AgentTab({ token }: AgentTabProps) {
             return s;
           }),
         );
+
+        // Feed into activity store
+        const activityType =
+          msgType === 'tool_start' ? 'tool' :
+          msgType === 'tool_success' ? 'tool' :
+          msgType === 'tool_error' ? 'error' :
+          msgType === 'error' ? 'error' :
+          msgType === 'complete' ? 'message' : 'message';
+        const activityStatus =
+          msgType === 'tool_success' || msgType === 'complete' ? 'success' :
+          msgType === 'tool_error' || msgType === 'error' ? 'failed' :
+          msgType === 'tool_start' ? 'pending' : 'success';
+
+        if (msgType === 'tool_start') {
+          lastActivityId.current = addActivity({
+            type: activityType,
+            status: activityStatus,
+            message: newMsg.message,
+            sessionId: msg.sessionId,
+          });
+        } else if ((msgType === 'tool_success' || msgType === 'tool_error') && lastActivityId.current) {
+          updateActivity(lastActivityId.current, { status: activityStatus, detail: newMsg.message });
+          lastActivityId.current = null;
+        } else {
+          addActivity({
+            type: activityType,
+            status: activityStatus,
+            message: newMsg.message,
+            sessionId: msg.sessionId,
+          });
+        }
 
         if (msgType === 'complete' || msgType === 'error') {
           setIsRunning(false);
@@ -1933,6 +1972,32 @@ function AgentTab({ token }: AgentTabProps) {
       {runError && (
         <p style={{ color: '#f87171', fontSize: '12px', margin: '6px 0 0 0' }}>{runError}</p>
       )}
+
+      {/* Activity Log toggle */}
+      <div style={{ marginTop: '6px', border: '1px solid #1e293b', borderRadius: '6px', overflow: 'hidden' }}>
+        <button
+          onClick={() => setShowActivityLog((v) => !v)}
+          style={{
+            width: '100%',
+            background: '#0f172a',
+            border: 'none',
+            padding: '5px 10px',
+            color: '#64748b',
+            fontSize: '11px',
+            cursor: 'pointer',
+            textAlign: 'left',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <span>{showActivityLog ? '▲' : '▼'} Activity Log</span>
+          <span style={{ color: '#475569' }}>⚡</span>
+        </button>
+        {showActivityLog && (
+          <ActivityLog sessionId={activeSessionId ?? undefined} maxHeight="200px" />
+        )}
+      </div>
 
       {/* Previous sessions collapsed panel */}
       {completedSessions.length > 0 && (
@@ -3948,6 +4013,8 @@ function SidePanel() {
   const { user, token, isLoading, setUser, setToken, setLoading } = useAuthStore();
   const [activeTab, setActiveTab] = useState<Tab>('agent');
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
+  const confirmCallbacks = useRef<Map<string, (allowed: boolean) => void>>(new Map());
 
   // Load saved theme and check backend health on mount
   useEffect(() => {
@@ -3958,6 +4025,23 @@ function SidePanel() {
     fetch(`${backendUrl}/health`, { signal: AbortSignal.timeout(4000) })
       .then((r) => setBackendOnline(r.ok))
       .catch(() => setBackendOnline(false));
+  }, []);
+
+  // Listen for confirmation requests from background/content scripts
+  useEffect(() => {
+    const handler = (msg: { type: string; confirmationId?: string; action?: string; description?: string; risk?: PendingConfirmation['risk']; params?: Record<string, unknown> }) => {
+      if (msg.type === 'request_confirmation' && msg.confirmationId) {
+        setPendingConfirmation({
+          id: msg.confirmationId,
+          action: msg.action ?? 'unknown',
+          description: msg.description ?? 'The AI wants to perform an action.',
+          risk: msg.risk ?? 'medium',
+          params: msg.params,
+        });
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    return () => chrome.runtime.onMessage.removeListener(handler);
   }, []);
 
   useEffect(() => {
@@ -4120,6 +4204,25 @@ function SidePanel() {
         {activeTab === 'schedule' && token && (backendOnline === false ? <TabOfflineScreen /> : <ScheduleTab token={token} />)}
         {activeTab === 'settings' && token && <SettingsTab token={token} />}
       </div>
+
+      {/* Action confirmation overlay — shown when AI requests a high-risk action */}
+      {pendingConfirmation && (
+        <ActionConfirmation
+          confirmation={pendingConfirmation}
+          onAllow={(id) => {
+            const cb = confirmCallbacks.current.get(id);
+            if (cb) { cb(true); confirmCallbacks.current.delete(id); }
+            chrome.runtime.sendMessage({ type: 'confirmation_response', confirmationId: id, allowed: true }).catch(() => {});
+            setPendingConfirmation(null);
+          }}
+          onBlock={(id) => {
+            const cb = confirmCallbacks.current.get(id);
+            if (cb) { cb(false); confirmCallbacks.current.delete(id); }
+            chrome.runtime.sendMessage({ type: 'confirmation_response', confirmationId: id, allowed: false }).catch(() => {});
+            setPendingConfirmation(null);
+          }}
+        />
+      )}
     </div>
   );
 }
