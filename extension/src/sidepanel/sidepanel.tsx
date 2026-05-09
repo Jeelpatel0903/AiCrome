@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   onAuthStateChanged,
-  signInWithPopup,
+  signInWithCredential,
   GoogleAuthProvider,
   signInWithEmailAndPassword,
   signOut,
@@ -37,7 +37,22 @@ function LoginScreen() {
     setLoading(true);
     setError(null);
     try {
-      await signInWithPopup(auth, new GoogleAuthProvider());
+      if (typeof chrome === 'undefined' || !chrome.identity?.getAuthToken) {
+        throw new Error('Google sign-in is only available inside the Chrome extension.');
+      }
+      const token = await new Promise<string>((resolve, reject) => {
+        chrome.identity.getAuthToken({ interactive: true }, (token) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else if (!token) {
+            reject(new Error('No auth token returned by Chrome'));
+          } else {
+            resolve(token);
+          }
+        });
+      });
+      const credential = GoogleAuthProvider.credential(null, token);
+      await signInWithCredential(auth, credential);
     } catch (err: unknown) {
       const e = err as { message?: string };
       setError(e.message ?? 'Google sign-in failed');
