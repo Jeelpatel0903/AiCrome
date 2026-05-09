@@ -12,6 +12,7 @@ import { preferencesRoutes } from './routes/preferences';
 import { agentRoutes } from './routes/agent';
 import { workflowRoutes, workflowSharedRoutes } from './routes/workflows';
 import { scheduleRoutes } from './routes/schedules';
+import { aiConfigRoutes } from './routes/ai-config';
 import { startScheduler } from './services/scheduler';
 
 const server = Fastify({
@@ -49,7 +50,7 @@ async function start() {
 
   // Agent config — lets the extension know which model is active and if key is set
   server.get('/agent/config', async () => ({
-    model: process.env.AGENT_MODEL ?? 'claude-opus-4-7',
+    model: process.env.AGENT_MODEL ?? 'claude-sonnet-4-5',
     hasAnthropicKey: !!config.ANTHROPIC_API_KEY,
     version: '1.0.0',
   }));
@@ -59,6 +60,7 @@ async function start() {
   await server.register(memoryRoutes, { prefix: '/memory' });
   await server.register(preferencesRoutes, { prefix: '/preferences' });
   await server.register(agentRoutes, { prefix: '/agent' });
+  await server.register(aiConfigRoutes, { prefix: '/ai-config' });
   await server.register(workflowRoutes, { prefix: '/workflows' });
   await server.register(workflowSharedRoutes, { prefix: '/workflows/shared' });
   await server.register(scheduleRoutes, { prefix: '/schedules' });

@@ -52,7 +52,10 @@ function connectWebSocket(uid: string, token: string) {
       };
 
       // Forward progress messages to sidepanel
-      chrome.runtime.sendMessage({ ...msg, type: 'progress_update' }).catch(() => {
+      // Preserve the original server `type` as `type_` so the sidepanel can
+      // distinguish 'complete' / 'error' / 'tool_start' etc., while `type`
+      // stays 'progress_update' so the sidepanel listener fires.
+      chrome.runtime.sendMessage({ ...msg, type_: msg.type, type: 'progress_update' }).catch(() => {
         // Sidepanel might not be open
       });
 

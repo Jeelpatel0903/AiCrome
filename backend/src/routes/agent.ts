@@ -15,6 +15,7 @@ import { randomUUID } from 'crypto';
 interface RunBody {
   command: string;
   currentUrl?: string;
+  sessionId?: string; // optional: frontend can pre-generate to avoid race condition
 }
 
 export async function agentRoutes(fastify: FastifyInstance): Promise<void> {
@@ -59,13 +60,15 @@ export async function agentRoutes(fastify: FastifyInstance): Promise<void> {
     { preHandler: authMiddleware },
     async (request, reply) => {
       const { uid: userId } = request.user;
-      const { command, currentUrl } = request.body;
+      const { command, currentUrl, sessionId: clientSessionId } = request.body;
 
       if (!command || typeof command !== 'string' || !command.trim()) {
         return reply.status(400).send({ success: false, error: 'command is required' });
       }
 
-      const sessionId = randomUUID();
+      // Use the frontend-provided sessionId if present (avoids WebSocket race condition),
+      // otherwise generate one here.
+      const sessionId = clientSessionId ?? randomUUID();
 
       const sendProgress = async (type: string, message: string): Promise<void> => {
         sendToUser(userId, {

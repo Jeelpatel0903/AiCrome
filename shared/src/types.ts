@@ -218,3 +218,60 @@ export interface UserSettings {
   askBeforeSubmit: boolean;
   progressNotifications: boolean;
 }
+
+// ==================== AI CONFIG ====================
+
+export type AIProvider = 'anthropic' | 'openai' | 'deepseek';
+
+export interface ModelInfo {
+  id: string;    // e.g. 'claude-sonnet-4-5'
+  label: string; // e.g. 'Claude Sonnet 4.5'
+}
+
+export interface ProviderConfig {
+  label: string;
+  models: ModelInfo[];
+}
+
+export const PROVIDER_MODELS: Record<AIProvider, ProviderConfig> = {
+  anthropic: {
+    label: 'Anthropic',
+    models: [
+      { id: 'claude-sonnet-4-5',        label: 'Claude Sonnet 4.5' },
+      { id: 'claude-opus-4-7',          label: 'Claude Opus 4.7' },
+      { id: 'claude-3-5-haiku-20241022', label: 'Claude Haiku 3.5' },
+    ],
+  },
+  openai: {
+    label: 'OpenAI',
+    models: [
+      { id: 'gpt-4o',      label: 'GPT-4o' },
+      { id: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+      { id: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+    ],
+  },
+  deepseek: {
+    label: 'DeepSeek',
+    models: [
+      { id: 'deepseek-chat',     label: 'DeepSeek Chat' },
+      { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
+    ],
+  },
+};
+
+/** Full config resolved at runtime (API key decrypted — backend only) */
+export interface AIConfig {
+  provider: AIProvider;
+  model: string;
+  apiKey: string;
+  source: 'db' | 'env';
+}
+
+/** Safe public shape returned by GET /ai-config (key never exposed) */
+export interface AIConfigPublic {
+  provider: AIProvider;
+  model: string;
+  hasKey: boolean;
+  source: 'db' | 'env';
+  enabled: boolean;
+}
