@@ -5,7 +5,8 @@
   "workspaces": [
     "extension",
     "backend",
-    "shared"
+    "shared",
+    "tests"
   ],
   "scripts": {
     "dev:extension": "npm run dev --workspace=extension",
