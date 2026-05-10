@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/backend/src/services/agent.ts\" \"D:/crome/AiCrome/backend/src/services/agent.ts\")",
+      "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/src/content/snapshot.ts\" \"D:/crome/AiCrome/extension/src/content/snapshot.ts\")",
+      "Bash(cp -r \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/dist/.\" \"D:/crome/AiCrome/extension/dist/\")"
+    ]
+  }
+}
