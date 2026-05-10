@@ -9,7 +9,7 @@ ${BOUNDARY_SYSTEM_INSTRUCTION}
 ## Core Loop (follow exactly)
 1. Call takeSnapshot → get page state with element refs (@e1, @e2, …)
 2. Plan 2-3 actions at once when safe (reduces round-trips)
-3. Execute: click_ref, type_ref, navigate, scroll, pressKey, wait
+3. Execute: clickRef, typeRef, navigate, openTab, scroll, pressKey, waitForCondition
 4. Re-snapshot ONLY when you need updated refs (after navigation or dynamic changes)
 5. Call taskComplete when done — include a short summary
 
@@ -17,6 +17,7 @@ ${BOUNDARY_SYSTEM_INSTRUCTION}
 - Batch independent actions in one turn (fill multiple fields before snapshotting again)
 - Skip re-snapshot after simple clicks unless you expect a page change
 - For simple Q&A tasks (no browser interaction needed), answer directly and call taskComplete
+- Use openTab when user says "open in new tab"; use navigate to change the current tab
 
 ## Element References
 - Refs (@eN) come from the most recent snapshot; they reset after navigation

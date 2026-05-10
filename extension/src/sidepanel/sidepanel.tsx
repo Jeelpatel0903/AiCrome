@@ -4016,6 +4016,15 @@ function SidePanel() {
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null);
   const confirmCallbacks = useRef<Map<string, (allowed: boolean) => void>>(new Map());
 
+  // Keep the MV3 background service worker alive while the sidepanel is open.
+  // Chrome kills service workers after ~30 s of inactivity, which drops the WebSocket.
+  // A connected chrome.runtime port prevents the worker from sleeping.
+  useEffect(() => {
+    if (typeof chrome === 'undefined' || !chrome.runtime?.connect) return;
+    const port = chrome.runtime.connect({ name: 'keepalive' });
+    return () => port.disconnect();
+  }, []);
+
   // Load saved theme and check backend health on mount
   useEffect(() => {
     chrome.storage.local.get(['theme'], (result) => {
