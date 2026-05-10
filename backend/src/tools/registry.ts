@@ -104,7 +104,7 @@ export class ToolRegistry {
       return await Promise.race([
         tool.execute(params, context),
         new Promise<ToolResult>((_, reject) =>
-          setTimeout(() => reject(new Error(`Tool ${name} timed out after 30s`)), 30000),
+          setTimeout(() => reject(new Error(`Tool ${name} timed out after 60s`)), 60000),
         ),
       ]);
     } catch (err) {

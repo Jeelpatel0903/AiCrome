@@ -121,36 +121,105 @@ function connectWebSocket(uid: string, token: string) {
             }
           });
         } else {
-          // Forward other actions to content script
+          // Forward other actions to content script (with auto-injection fallback)
           chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs[0]?.id) {
-              chrome.tabs.sendMessage(
-                tabs[0].id,
-                {
-                  type: 'devflow_action',
+            const tab = tabs[0];
+            if (!tab?.id) return;
+
+            const tabId = tab.id;
+            const tabUrl = tab.url ?? '';
+
+            // Non-injectable pages: chrome://, about:, extension pages, etc.
+            const isInjectable =
+              tabUrl.startsWith('http://') ||
+              tabUrl.startsWith('https://') ||
+              tabUrl.startsWith('file://');
+
+            if (!isInjectable) {
+              ws?.send(
+                JSON.stringify({
+                  type: 'bridge_result',
                   requestId: bridgeReq.requestId,
-                  action: bridgeReq.action,
-                  params: bridgeReq.params,
+                  success: false,
+                  error: `Cannot run on this page (${tabUrl.split(':')[0]}:// pages are restricted). Please navigate to a regular website first.`,
+                }),
+              );
+              return;
+            }
+
+            const actionMsg = {
+              type: 'devflow_action',
+              requestId: bridgeReq.requestId,
+              action: bridgeReq.action,
+              params: bridgeReq.params,
+            };
+
+            // Helper: send message and return result via callback
+            const trySend = (
+              onResult: (result: { success: boolean; data?: Record<string, unknown>; error?: string }) => void,
+            ) => {
+              chrome.tabs.sendMessage(
+                tabId,
+                actionMsg,
+                (response: { success: boolean; data?: Record<string, unknown>; error?: string } | undefined) => {
+                  if (chrome.runtime.lastError) {
+                    onResult({ success: false, error: chrome.runtime.lastError.message ?? 'Content script error' });
+                  } else {
+                    onResult(response ?? { success: false, error: 'No response from content script' });
+                  }
                 },
-                (
-                  response:
-                    | { success: boolean; data?: Record<string, unknown>; error?: string }
-                    | undefined,
-                ) => {
-                  const result = response || {
-                    success: false,
-                    error: 'No response from content script',
-                  };
+              );
+            };
+
+            // First attempt
+            trySend((result) => {
+              const errMsg = result.error ?? '';
+              const needsInjection =
+                !result.success &&
+                (errMsg.includes('Receiving end does not exist') ||
+                  errMsg.includes('Could not establish connection') ||
+                  errMsg.includes('No response from content script'));
+
+              if (!needsInjection) {
+                // Success or a real tool error — send as-is
+                ws?.send(
+                  JSON.stringify({
+                    type: 'bridge_result',
+                    requestId: bridgeReq.requestId,
+                    ...result,
+                  }),
+                );
+                return;
+              }
+
+              // Inject content script then retry
+              chrome.scripting
+                .executeScript({ target: { tabId }, files: ['content.js'] })
+                .then(() => {
+                  // Give the script 300 ms to initialise
+                  setTimeout(() => {
+                    trySend((retryResult) => {
+                      ws?.send(
+                        JSON.stringify({
+                          type: 'bridge_result',
+                          requestId: bridgeReq.requestId,
+                          ...retryResult,
+                        }),
+                      );
+                    });
+                  }, 300);
+                })
+                .catch((injectErr: unknown) => {
                   ws?.send(
                     JSON.stringify({
                       type: 'bridge_result',
                       requestId: bridgeReq.requestId,
-                      ...result,
+                      success: false,
+                      error: `Content script injection failed: ${String(injectErr)}`,
                     }),
                   );
-                },
-              );
-            }
+                });
+            });
           });
         }
       }

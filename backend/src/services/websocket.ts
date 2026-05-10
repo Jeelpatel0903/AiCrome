@@ -41,13 +41,13 @@ export function registerBridgeRequest(
   }) => void,
 ): void {
   pendingBridgeRequests.set(requestId, resolve);
-  // Auto-cleanup after 35 seconds
+  // Auto-cleanup after 65 seconds (matches 60s tool timeout + buffer)
   setTimeout(() => {
     if (pendingBridgeRequests.has(requestId)) {
       pendingBridgeRequests.delete(requestId);
       resolve({ success: false, error: 'Bridge request timed out' });
     }
-  }, 35000);
+  }, 65000);
 }
 
 export function resolveBridgeRequest(
