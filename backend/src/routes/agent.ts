@@ -8,6 +8,8 @@ import {
   sendToUser,
   registerBridgeRequest,
   resolveBridgeRequest,
+  registerUserQuestion,
+  resolveUserAnswer,
 } from '../services/websocket';
 import { randomUUID } from 'crypto';
 
@@ -99,6 +101,11 @@ export async function agentRoutes(fastify: FastifyInstance): Promise<void> {
         });
       };
 
+      const waitForUserAnswer = (questionId: string): Promise<string> =>
+        new Promise<string>((resolve) => {
+          registerUserQuestion(questionId, resolve);
+        });
+
       // Run agent in background (don't await)
       void runAgent({
         command: command.trim(),
@@ -107,9 +114,27 @@ export async function agentRoutes(fastify: FastifyInstance): Promise<void> {
         currentUrl,
         sendProgress,
         sendBridgeAction,
+        waitForUserAnswer,
       });
 
       return reply.send({ success: true, sessionId });
+    },
+  );
+
+  // POST /answer — user answers a pending agent question
+  fastify.post<{ Body: { questionId: string; answer: string } }>(
+    '/answer',
+    { preHandler: authMiddleware },
+    async (request, reply) => {
+      const { questionId, answer } = request.body;
+      if (!questionId || typeof questionId !== 'string') {
+        return reply.status(400).send({ success: false, error: 'questionId is required' });
+      }
+      const resolved = resolveUserAnswer(questionId, answer ?? '');
+      return reply.send({
+        success: resolved,
+        message: resolved ? 'Answer received' : 'Question not found or already answered',
+      });
     },
   );
 
