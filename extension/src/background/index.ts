@@ -87,7 +87,7 @@ function sendBridgeResult(requestId: string, result: BridgeResult): void {
 function _pageSnapshot(): BridgeResult {
   try {
     const SEL = 'a[href],button,input:not([type="hidden"]),select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="menuitem"],[role="tab"],[role="combobox"],[contenteditable="true"]';
-    const MAX = 150;
+    const MAX = 80; // reduced from 150 — keeps context lean
     const candidates = Array.from(document.querySelectorAll(SEL));
 
     // Batch-read all rects ONCE to avoid repeated layout reflows
@@ -111,12 +111,12 @@ function _pageSnapshot(): BridgeResult {
 
     const capped = visible.slice(0, MAX);
     const more = visible.length > MAX;
-    const moreBelow = document.documentElement.scrollHeight > scrollY + vh + 50;
+    const moreBelow = document.documentElement.scrollHeight > window.scrollY + vh + 50;
 
     const lines: string[] = [
       `Page: ${document.title}`,
       `URL: ${location.href}`,
-      `Viewport: ${vh}px | Scroll: ${Math.round(scrollY)}/${document.documentElement.scrollHeight}${moreBelow ? ' (more below)' : ''}`,
+      `Viewport: ${vh}px | Scroll: ${Math.round(window.scrollY)}/${document.documentElement.scrollHeight}${moreBelow ? ' (more below)' : ''}`,
       `Elements: ${capped.length}${more ? ` of ${visible.length} (scroll for more)` : ''}`,
       '',
       'Interactive elements:',
@@ -134,7 +134,7 @@ function _pageSnapshot(): BridgeResult {
 
       let name =
         el.getAttribute('aria-label') ||
-        el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby')!)?.textContent?.trim() ||
+        (el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby')!)?.textContent?.trim()) ||
         el.textContent?.trim().replace(/\s+/g, ' ').slice(0, 80) ||
         inp.placeholder ||
         el.getAttribute('title') ||
@@ -155,7 +155,75 @@ function _pageSnapshot(): BridgeResult {
       );
     }
 
-    return { success: true, data: { text: lines.join('\n'), elementCount: capped.length, url: location.href } };
+    // ── Semantic page type detection ────────────────────────────────────────
+    let pageType = 'unknown';
+    if (document.querySelector('[role="dialog"], .modal, .modal-backdrop, [class*="modal"]')) {
+      pageType = 'modal';
+    } else if (document.querySelector('[role="alert"], .alert-danger, .error-message, [class*="error"]')
+      || /error|failed|invalid|wrong/i.test(document.body.innerText.slice(0, 500))) {
+      pageType = 'error';
+    } else if (document.querySelector('input[type="password"]')) {
+      pageType = 'login';
+    } else if ((document.querySelectorAll('table tr').length) > 5) {
+      pageType = 'list';
+    } else if ((document.querySelectorAll('form input, form select, form textarea').length) >= 3) {
+      pageType = 'form';
+    } else {
+      const href = location.href.toLowerCase();
+      if (/\/(dashboard|home|overview|main|index)/.test(href)) pageType = 'dashboard';
+      else if (/\/(detail|view|show|profile|account)/.test(href)) pageType = 'detail';
+    }
+
+    // ── Detected forms ───────────────────────────────────────────────────────
+    const forms: Array<{
+      fields: Array<{ ref: string; label: string; type: string; required: boolean; currentValue?: string }>;
+      submitRef?: string;
+    }> = [];
+
+    document.querySelectorAll('form').forEach((form) => {
+      const fields: Array<{ ref: string; label: string; type: string; required: boolean; currentValue?: string }> = [];
+      let submitRef: string | undefined;
+
+      form.querySelectorAll('input:not([type="hidden"]),select,textarea').forEach((field) => {
+        const f = field as HTMLInputElement;
+        const ref = f.getAttribute('data-ai-ref');
+        if (!ref) return;
+        // Find label
+        const id = f.id;
+        let label = f.getAttribute('aria-label') || '';
+        if (!label && id) label = document.querySelector(`label[for="${id}"]`)?.textContent?.trim() ?? '';
+        if (!label) label = f.placeholder || f.name || f.type || '';
+        fields.push({
+          ref: `@${ref}`,
+          label: label.slice(0, 60),
+          type: f.type || f.tagName.toLowerCase(),
+          required: f.required,
+          currentValue: f.value || undefined,
+        });
+      });
+
+      // Find submit button
+      const submitEl = form.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
+      if (submitEl) {
+        const sRef = submitEl.getAttribute('data-ai-ref');
+        if (sRef) submitRef = `@${sRef}`;
+      }
+
+      if (fields.length > 0) forms.push({ fields, submitRef });
+    });
+
+    return {
+      success: true,
+      data: {
+        text: lines.join('\n'),
+        elementCount: capped.length,
+        url: location.href,
+        title: document.title,
+        bodyLength: document.body.innerText.length,
+        pageType,
+        forms,
+      },
+    };
   } catch (e) {
     return { success: false, error: String(e) };
   }
@@ -259,6 +327,20 @@ function _pageCheckCondition(condition: { type: string; ref?: string; text?: str
         return { met: condition.substring ? location.href.includes(condition.substring) : false };
       case 'network-idle':
         return { met: document.readyState === 'complete' };
+      case 'page-mutated': {
+        // Detect significant DOM changes (e.g. after OAuth redirect, SPA navigation, login success)
+        // Uses a page-level hash stored in the isolated world across executeScript calls.
+        const w = window as Window & { __aiPageHash?: string };
+        const h = `${document.title}|${document.body.innerText.length}|${document.querySelectorAll('[data-ai-ref]').length}`;
+        if (!w.__aiPageHash) {
+          // First poll: record baseline
+          w.__aiPageHash = h;
+          return { met: false };
+        }
+        const changed = h !== w.__aiPageHash;
+        if (changed) w.__aiPageHash = undefined; // Reset so it can be reused
+        return { met: changed };
+      }
       default:
         return { met: false };
     }
@@ -281,9 +363,27 @@ async function runInTab(tabId: number, requestId: string, action: string, params
 
       case 'click_ref': {
         const ref = String(params.ref ?? '').replace('@', '');
+        // Snapshot open windows before click so we can detect OAuth popups
+        const winsBefore = await chrome.windows.getAll();
+        const winIdsBefore = new Set(winsBefore.map((w) => w.id));
         results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageClickRef, args: [ref] });
-        // Small settle delay after click
-        await new Promise((r) => setTimeout(r, 400));
+        // Settle: give OAuth popup time to open
+        await new Promise((r) => setTimeout(r, 700));
+        // Detect new popup window (e.g. Google / GitHub OAuth)
+        const winsAfter = await chrome.windows.getAll();
+        const newPopup = winsAfter.find((w) => !winIdsBefore.has(w.id) && w.type === 'popup');
+        if (newPopup) {
+          const popupTab = newPopup.tabs?.[0];
+          sendBridgeResult(requestId, {
+            success: true,
+            data: {
+              popupOpened: true,
+              popupUrl: popupTab?.url ?? '',
+              note: 'An OAuth popup window opened. Use waitForCondition:page-mutated or text-present to detect login completion on the original page.',
+            },
+          });
+          return;
+        }
         break;
       }
 
@@ -297,8 +397,24 @@ async function runInTab(tabId: number, requestId: string, action: string, params
 
       case 'click': {
         const description = String(params.description ?? '');
+        const winsBefore2 = await chrome.windows.getAll();
+        const winIdsBefore2 = new Set(winsBefore2.map((w) => w.id));
         results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageClick, args: [description] });
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 700));
+        const winsAfter2 = await chrome.windows.getAll();
+        const newPopup2 = winsAfter2.find((w) => !winIdsBefore2.has(w.id) && w.type === 'popup');
+        if (newPopup2) {
+          const popupTab2 = newPopup2.tabs?.[0];
+          sendBridgeResult(requestId, {
+            success: true,
+            data: {
+              popupOpened: true,
+              popupUrl: popupTab2?.url ?? '',
+              note: 'An OAuth popup window opened. Use waitForCondition:page-mutated or text-present to detect login completion on the original page.',
+            },
+          });
+          return;
+        }
         break;
       }
 
