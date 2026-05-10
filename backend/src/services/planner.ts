@@ -141,17 +141,22 @@ export async function runIntentLock(
       model,
     });
 
-    const parsed = parseJsonResponse(response.textContent) as Partial<IntentLock> | null;
-    if (parsed && typeof parsed.understood_as === 'string') {
+    const parsed = parseJsonResponse(response.textContent) as Record<string, unknown> | null;
+    if (parsed && typeof parsed['understood_as'] === 'string') {
+      const willNotDo = Array.isArray(parsed['will_not_do'])
+        ? (parsed['will_not_do'] as unknown[]).filter((x): x is string => typeof x === 'string')
+        : [];
       return {
-        understood_as: parsed.understood_as,
-        scope: parsed.scope ?? 'current browser tab',
-        will_not_do: Array.isArray(parsed.will_not_do) ? parsed.will_not_do : [],
-        ready_to_proceed: parsed.ready_to_proceed !== false,
-        clarification_needed: parsed.clarification_needed,
+        understood_as: parsed['understood_as'],
+        scope: typeof parsed['scope'] === 'string' ? parsed['scope'] : 'current browser tab',
+        will_not_do: willNotDo,
+        ready_to_proceed: parsed['ready_to_proceed'] !== false,
+        clarification_needed: typeof parsed['clarification_needed'] === 'string' ? parsed['clarification_needed'] : undefined,
       };
     }
-  } catch { /* fall through to default */ }
+  } catch (err) {
+    console.warn('[planner] AI call failed, using fallback:', err instanceof Error ? err.message : String(err));
+  }
 
   // Fallback: proceed with the raw command as-is
   return {
@@ -196,7 +201,9 @@ export async function runPlanning(
       return {
         goal: parsed.goal ?? intentLock.understood_as,
         scope: parsed.scope ?? intentLock.scope,
-        willNotDo: parsed.will_not_do ?? intentLock.will_not_do,
+        willNotDo: Array.isArray(parsed.will_not_do)
+          ? (parsed.will_not_do as unknown[]).filter((x): x is string => typeof x === 'string')
+          : intentLock.will_not_do,
         steps: parsed.steps.map((s, i) => ({
           index: s.index ?? i + 1,
           description: s.description ?? `Step ${i + 1}`,
@@ -208,13 +215,15 @@ export async function runPlanning(
           failedAttempts: [],
         })),
         currentStepIndex: 0,
-        complexity: (['simple', 'medium', 'complex'].includes(parsed.complexity ?? '')
-          ? parsed.complexity
-          : 'medium') as PlannedTask['complexity'],
+        complexity: (['simple', 'medium', 'complex'].includes(parsed.complexity ?? '') && parsed.complexity
+          ? parsed.complexity as PlannedTask['complexity']
+          : 'medium'),
         createdAt: Date.now(),
       };
     }
-  } catch { /* fall through to default */ }
+  } catch (err) {
+    console.warn('[planner] AI call failed, using fallback:', err instanceof Error ? err.message : String(err));
+  }
 
   // Fallback: two-step plan (observe + interact)
   return {
@@ -223,7 +232,7 @@ export async function runPlanning(
     willNotDo: intentLock.will_not_do,
     steps: [
       { index: 1, description: 'Take snapshot to assess current page', type: 'observe', completed: false, attempts: 0, failedAttempts: [] },
-      { index: 2, description: command, type: 'interact', completed: false, attempts: 0, failedAttempts: [] },
+      { index: 2, description: `Complete task: ${command.slice(0, 100)}`, type: 'interact', completed: false, attempts: 0, failedAttempts: [] },
     ],
     currentStepIndex: 0,
     complexity: 'medium',
