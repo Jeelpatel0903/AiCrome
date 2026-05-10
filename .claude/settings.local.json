@@ -5,7 +5,9 @@
       "Bash(npm run *)",
       "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/backend/src/services/agent.ts\" \"D:/crome/AiCrome/backend/src/services/agent.ts\")",
       "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/src/content/snapshot.ts\" \"D:/crome/AiCrome/extension/src/content/snapshot.ts\")",
-      "Bash(cp -r \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/dist/.\" \"D:/crome/AiCrome/extension/dist/\")"
+      "Bash(cp -r \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/dist/.\" \"D:/crome/AiCrome/extension/dist/\")",
+      "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/extension/src/background/index.ts\" \"D:/crome/AiCrome/extension/src/background/index.ts\")",
+      "Bash(cp \"D:/crome/AiCrome/.claude/worktrees/nice-jang-96e33d/backend/src/tools/implementations.ts\" \"D:/crome/AiCrome/backend/src/tools/implementations.ts\")"
     ]
   }
 }

@@ -17,6 +17,8 @@ export interface ToolDefinition {
     properties: Record<string, { type: string; description: string; enum?: string[] }>;
     required: string[];
   };
+  /** If true, skip the 60s timeout (for interactive tools that wait for user input) */
+  noTimeout?: boolean;
   execute: (params: Record<string, unknown>, context: ToolContext) => Promise<ToolResult>;
 }
 
@@ -26,6 +28,8 @@ export interface ToolContext {
   sendProgress: (type: string, message: string) => Promise<void>;
   // Bridge: send action to Chrome extension and wait for result
   sendBridgeAction: (action: string, params: Record<string, unknown>) => Promise<BridgeResult>;
+  // Q&A: wait for the user to answer a question
+  waitForUserAnswer: (questionId: string) => Promise<string>;
 }
 
 export interface ToolResult {
@@ -101,6 +105,10 @@ export class ToolRegistry {
       return { success: false, error: `Unknown tool: ${name}` };
     }
     try {
+      // Interactive tools (e.g. askUserQuestion) opt out of the 60s timeout
+      if (tool.noTimeout) {
+        return await tool.execute(params, context);
+      }
       return await Promise.race([
         tool.execute(params, context),
         new Promise<ToolResult>((_, reject) =>

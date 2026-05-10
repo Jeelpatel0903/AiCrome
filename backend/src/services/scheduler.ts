@@ -85,6 +85,10 @@ export function startScheduler(): void {
           return { success: false, error: 'Browser automation requires extension connection' };
         };
 
+        const waitForUserAnswer = (_questionId: string): Promise<string> =>
+          // Scheduled runs have no interactive user — return empty immediately
+          Promise.resolve('');
+
         try {
           await runAgent({
             command: schedule.command,
@@ -92,6 +96,7 @@ export function startScheduler(): void {
             userId: schedule.userId,
             sendProgress,
             sendBridgeAction,
+            waitForUserAnswer,
           });
 
           await db

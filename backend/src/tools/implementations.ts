@@ -217,8 +217,8 @@ toolRegistry.register({
     properties: {
       conditionType: {
         type: 'string',
-        enum: ['element-visible', 'element-gone', 'text-present', 'url-contains', 'network-idle', 'delay'],
-        description: 'Type of condition to wait for',
+        enum: ['element-visible', 'element-gone', 'text-present', 'url-contains', 'page-mutated', 'network-idle', 'delay'],
+        description: 'Type of condition to wait for. Use page-mutated after OAuth/social login clicks (URL does not change but page content updates). Use text-present to wait for specific post-login UI text.',
       },
       ref: { type: 'string', description: 'Element ref for element-visible/element-gone conditions' },
       text: { type: 'string', description: 'Text to look for (text-present condition)' },
@@ -553,11 +553,42 @@ toolRegistry.register({
   },
 });
 
+// listIdentities — show agent what's in the vault (no passwords)
+toolRegistry.register({
+  name: 'listIdentities',
+  description:
+    "List all saved vault identities (name and site URL only — no passwords). Call this first when the user says 'get from vault' or 'use my saved credentials', so you know which identity name to use with getIdentity.",
+  category: 'identity',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+  async execute(_params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    try {
+      const itemsRef = db
+        .collection('identities')
+        .doc(context.userId)
+        .collection('items');
+      const snapshot = await itemsRef.where('deletedAt', '==', null).get();
+
+      const identities = snapshot.docs.map((doc) => {
+        const d = doc.data() as IdentityDocument;
+        return { name: d.name, siteUrl: d.siteUrl ?? '' };
+      });
+
+      return { success: true, data: { identities } };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+});
+
 // getIdentity
 toolRegistry.register({
   name: 'getIdentity',
   description:
-    "Get saved login credentials by identity name (e.g. 'Jeel', 'Dev'). Returns username and password. Use when user says 'login as [name]' or when you need credentials for a site.",
+    "Get saved login credentials by identity name (e.g. 'Jeel', 'Dev'). Returns username and password. Use when user says 'login as [name]' or when you need credentials for a site. Call listIdentities first if you don't know the exact name.",
   category: 'identity',
   inputSchema: {
     type: 'object',
@@ -566,11 +597,15 @@ toolRegistry.register({
         type: 'string',
         description: 'The identity name to look up (case-insensitive)',
       },
+      siteUrl: {
+        type: 'string',
+        description: 'Optional: current page URL to find the best-matching identity by site',
+      },
     },
     required: ['name'],
   },
   async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
-    const { name } = params as { name: string };
+    const { name, siteUrl } = params as { name: string; siteUrl?: string };
 
     try {
       const itemsRef = db
@@ -579,16 +614,38 @@ toolRegistry.register({
         .collection('items');
       const snapshot = await itemsRef.where('deletedAt', '==', null).get();
 
-      const match = snapshot.docs.find(
-        (doc) =>
-          (doc.data() as IdentityDocument).name.toLowerCase() === name.toLowerCase(),
-      );
+      const docs = snapshot.docs.map((doc) => ({ ref: doc.ref, data: doc.data() as IdentityDocument, id: doc.id }));
 
-      if (!match) {
-        return { success: false, error: `Identity '${name}' not found` };
+      // 1. Exact name match (case-insensitive)
+      let match = docs.find((d) => d.data.name.toLowerCase() === name.toLowerCase());
+
+      // 2. If not found by name and a siteUrl is provided, try hostname match
+      if (!match && siteUrl) {
+        let targetHost = '';
+        try { targetHost = new URL(siteUrl).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+        if (targetHost) {
+          match = docs.find((d) => {
+            let identityHost = '';
+            try { identityHost = new URL(d.data.siteUrl ?? '').hostname.replace(/^www\./, ''); } catch { /* ignore */ }
+            return identityHost && targetHost.includes(identityHost) || identityHost.includes(targetHost);
+          });
+        }
       }
 
-      const doc = match.data() as IdentityDocument;
+      // 3. Partial name match as last resort
+      if (!match) {
+        match = docs.find((d) => d.data.name.toLowerCase().includes(name.toLowerCase()) || name.toLowerCase().includes(d.data.name.toLowerCase()));
+      }
+
+      if (!match) {
+        const available = docs.map((d) => d.data.name).join(', ');
+        return {
+          success: false,
+          error: `Identity '${name}' not found. Available identities: ${available || 'none'}. Call listIdentities to see all saved credentials.`,
+        };
+      }
+
+      const doc = match.data;
       const password = decrypt(doc.passwordEncrypted);
 
       // Update lastUsed
@@ -700,19 +757,20 @@ toolRegistry.register({
   },
 });
 
-// askUserQuestion
+// askUserQuestion — sends a question popup to the user and WAITS for their answer
 toolRegistry.register({
   name: 'askUserQuestion',
   description:
-    'Ask the user a question when you need clarification. Use when the command is genuinely ambiguous. Provide options when possible to make it easier to respond.',
+    'Ask the user a question when you need clarification. Waits for the user to answer before continuing. Use when the command is genuinely ambiguous. Provide options when possible to make it easier to respond.',
   category: 'communication',
+  noTimeout: true, // user may take time to respond; skip the 60s tool timeout
   inputSchema: {
     type: 'object',
     properties: {
       question: { type: 'string', description: 'The question to ask the user' },
       options: {
         type: 'string',
-        description: 'Optional comma-separated list of answer options',
+        description: 'Optional comma-separated list of answer options (e.g. "Yes,No,Cancel")',
       },
     },
     required: ['question'],
@@ -726,18 +784,27 @@ toolRegistry.register({
           .filter((o) => o.length > 0)
       : undefined;
 
+    const questionId = randomUUID();
+
+    // Notify the frontend — it will render a popup and POST the answer to /agent/answer
     await context.sendProgress(
       'asking',
-      JSON.stringify({ question, options: optionsArray }),
+      JSON.stringify({ questionId, question, options: optionsArray }),
     );
+
+    // Block until the user answers (or 10-minute auto-expire)
+    const answer = await context.waitForUserAnswer(questionId);
+
+    if (!answer) {
+      return {
+        success: true,
+        data: { answer: '', note: 'User did not respond within the timeout.' },
+      };
+    }
 
     return {
       success: true,
-      data: {
-        asked: true,
-        question,
-        note: 'Question sent to user. Continue after user responds.',
-      },
+      data: { answer },
     };
   },
 });

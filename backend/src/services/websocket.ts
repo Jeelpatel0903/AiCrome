@@ -62,3 +62,30 @@ export function resolveBridgeRequest(
   }
   return false;
 }
+
+// ─── User Q&A: agent asks a question and waits for the user to answer ────────
+const pendingUserAnswers = new Map<string, (answer: string) => void>();
+
+export function registerUserQuestion(
+  questionId: string,
+  resolve: (answer: string) => void,
+): void {
+  pendingUserAnswers.set(questionId, resolve);
+  // Auto-expire after 10 minutes with an empty string so the agent can continue
+  setTimeout(() => {
+    if (pendingUserAnswers.has(questionId)) {
+      pendingUserAnswers.delete(questionId);
+      resolve('');
+    }
+  }, 10 * 60 * 1000);
+}
+
+export function resolveUserAnswer(questionId: string, answer: string): boolean {
+  const resolve = pendingUserAnswers.get(questionId);
+  if (resolve) {
+    pendingUserAnswers.delete(questionId);
+    resolve(answer);
+    return true;
+  }
+  return false;
+}

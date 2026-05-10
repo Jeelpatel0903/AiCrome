@@ -1610,6 +1610,12 @@ function getCurrentUrl(): Promise<string> {
   });
 }
 
+interface PendingQuestion {
+  questionId: string;
+  question: string;
+  options?: string[];
+}
+
 function AgentTab({ token }: AgentTabProps) {
   const [sessions, setSessions] = useState<SessionEntry[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -1618,6 +1624,8 @@ function AgentTab({ token }: AgentTabProps) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [showActivityLog, setShowActivityLog] = useState(false);
+  const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
+  const [answerInput, setAnswerInput] = useState('');
   const addActivity = useActivityStore((s) => s.addEntry);
   const updateActivity = useActivityStore((s) => s.updateEntry);
   const lastActivityId = useRef<string | null>(null);
@@ -1744,6 +1752,18 @@ function AgentTab({ token }: AgentTabProps) {
         if (msgType === 'complete' || msgType === 'error') {
           setIsRunning(false);
           setCurrentSessionId(null);
+          setPendingQuestion(null);
+        }
+
+        // Detect agent questions — show popup
+        if (msgType === 'asking') {
+          try {
+            const payload = JSON.parse(newMsg.message) as { questionId?: string; question?: string; options?: string[] };
+            if (payload.questionId && payload.question) {
+              setPendingQuestion({ questionId: payload.questionId, question: payload.question, options: payload.options });
+              setAnswerInput('');
+            }
+          } catch { /* ignore parse errors */ }
         }
       }
     };
@@ -1828,6 +1848,20 @@ function AgentTab({ token }: AgentTabProps) {
 
   const handleClearCompleted = () => {
     setSessions((prev) => prev.filter((s) => s.status === 'running'));
+  };
+
+  const handleAnswerSubmit = async (answer: string) => {
+    if (!pendingQuestion) return;
+    const { questionId } = pendingQuestion;
+    setPendingQuestion(null);
+    setAnswerInput('');
+    try {
+      await fetch(`${backendUrl}/agent/answer`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ questionId, answer }),
+      });
+    } catch { /* ignore — agent will time out on its own */ }
   };
 
   const completedSessions = sessions.filter(
@@ -2083,6 +2117,97 @@ function AgentTab({ token }: AgentTabProps) {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Agent Question Popup */}
+      {pendingQuestion && (
+        <div
+          style={{
+            background: '#1e293b',
+            border: '1px solid #6366f1',
+            borderRadius: '12px',
+            padding: '14px',
+            marginBottom: '8px',
+            boxShadow: '0 4px 24px rgba(99,102,241,0.18)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '10px' }}>
+            <span style={{ fontSize: '18px', flexShrink: 0 }}>❓</span>
+            <span style={{ fontSize: '13px', color: '#e2e8f0', lineHeight: '1.5' }}>
+              {pendingQuestion.question}
+            </span>
+          </div>
+
+          {/* Option buttons (if provided) */}
+          {pendingQuestion.options && pendingQuestion.options.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '10px' }}>
+              {pendingQuestion.options.map((opt) => (
+                <button
+                  key={opt}
+                  onClick={() => void handleAnswerSubmit(opt)}
+                  style={{
+                    background: '#334155',
+                    border: '1px solid #475569',
+                    borderRadius: '20px',
+                    padding: '5px 14px',
+                    color: '#e2e8f0',
+                    fontSize: '12px',
+                    cursor: 'pointer',
+                    transition: 'background 0.15s',
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#6366f1'; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = '#334155'; }}
+                >
+                  {opt}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Free-text answer */}
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <input
+              type="text"
+              value={answerInput}
+              onChange={(e) => setAnswerInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && answerInput.trim()) {
+                  e.preventDefault();
+                  void handleAnswerSubmit(answerInput.trim());
+                }
+              }}
+              placeholder="Type your answer..."
+              autoFocus
+              style={{
+                flex: 1,
+                background: '#0f172a',
+                border: '1px solid #475569',
+                borderRadius: '8px',
+                padding: '7px 10px',
+                color: '#e2e8f0',
+                fontSize: '13px',
+                outline: 'none',
+              }}
+            />
+            <button
+              onClick={() => { if (answerInput.trim()) void handleAnswerSubmit(answerInput.trim()); }}
+              disabled={!answerInput.trim()}
+              style={{
+                background: answerInput.trim() ? '#6366f1' : '#374151',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '7px 14px',
+                color: 'white',
+                cursor: answerInput.trim() ? 'pointer' : 'not-allowed',
+                fontSize: '13px',
+                fontWeight: '600',
+                flexShrink: 0,
+              }}
+            >
+              Send
+            </button>
+          </div>
         </div>
       )}
 
