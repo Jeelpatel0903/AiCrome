@@ -12,7 +12,7 @@ interface PutBody {
   apiKey: string;
 }
 
-const VALID_PROVIDERS: AIProvider[] = ['anthropic', 'openai', 'deepseek'];
+const VALID_PROVIDERS: AIProvider[] = ['anthropic', 'openai', 'deepseek', 'github'];
 
 export async function aiConfigRoutes(fastify: FastifyInstance): Promise<void> {
   // GET /ai-config — returns current config without exposing the API key

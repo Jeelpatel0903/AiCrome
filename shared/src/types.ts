@@ -221,7 +221,7 @@ export interface UserSettings {
 
 // ==================== AI CONFIG =============
 
-export type AIProvider = 'anthropic' | 'openai' | 'deepseek';
+export type AIProvider = 'anthropic' | 'openai' | 'deepseek' | 'github';
 
 export interface ModelInfo {
   id: string;    // e.g. 'claude-sonnet-4-5'
@@ -255,6 +255,17 @@ export const PROVIDER_MODELS: Record<AIProvider, ProviderConfig> = {
     models: [
       { id: 'deepseek-chat',     label: 'DeepSeek Chat' },
       { id: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
+    ],
+  },
+  github: {
+    label: 'GitHub Models',
+    models: [
+      { id: 'gpt-4o',                label: 'GPT-4o' },
+      { id: 'gpt-4o-mini',           label: 'GPT-4o Mini' },
+      { id: 'o1-mini',               label: 'o1 Mini' },
+      { id: 'Meta-Llama-3.1-70B-Instruct', label: 'Llama 3.1 70B' },
+      { id: 'Meta-Llama-3.1-405B-Instruct', label: 'Llama 3.1 405B' },
+      { id: 'Mistral-large',         label: 'Mistral Large' },
     ],
   },
 };

@@ -196,6 +196,17 @@ class DeepSeekProviderClient extends OpenAIProviderClient {
 }
 
 // ---------------------------------------------------------------------------
+// GitHub Models implementation — OpenAI-compatible, uses GitHub PAT
+// Get a free key at: https://github.com/marketplace/models
+// ---------------------------------------------------------------------------
+
+class GitHubModelsProviderClient extends OpenAIProviderClient {
+  constructor(apiKey: string) {
+    super(apiKey, 'https://models.inference.ai.azure.com');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -208,6 +219,8 @@ export class AIProviderFactory {
         return new OpenAIProviderClient(config.apiKey);
       case 'deepseek':
         return new DeepSeekProviderClient(config.apiKey);
+      case 'github':
+        return new GitHubModelsProviderClient(config.apiKey);
       default: {
         const _exhaustive: never = config.provider;
         throw new Error(`Unsupported AI provider: ${String(_exhaustive)}`);
