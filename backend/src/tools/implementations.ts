@@ -89,22 +89,41 @@ function autoExtractTags(content: string, userTags: string[]): string[] {
 
 // ─── Tool registrations ───────────────────────────────────────────────────────
 
-// navigate
+// navigate — go to a URL in the current tab
 toolRegistry.register({
   name: 'navigate',
   description:
-    'Navigate the browser to a URL. Use when you need to go to a specific page. Always wait for page load before taking further actions.',
+    'Navigate the current browser tab to a URL. Use this to go to a different page in the same tab.',
   category: 'navigation',
   inputSchema: {
     type: 'object',
     properties: {
-      url: { type: 'string', description: 'The URL to navigate to' },
+      url: { type: 'string', description: 'The full URL to navigate to (must start with http:// or https://)' },
     },
     required: ['url'],
   },
   async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
     const url = params['url'] as string;
     return context.sendBridgeAction('navigate', { url });
+  },
+});
+
+// openTab — open a URL in a brand-new tab (use when user says "open in new tab")
+toolRegistry.register({
+  name: 'openTab',
+  description:
+    'Open a URL in a new browser tab. Use this when the user asks to "open in new tab" or when you want to open a page without leaving the current one. After the tab opens, call takeSnapshot to interact with it.',
+  category: 'navigation',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'The full URL to open in a new tab (must start with http:// or https://)' },
+    },
+    required: ['url'],
+  },
+  async execute(params: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    const url = params['url'] as string;
+    return context.sendBridgeAction('newtab', { url });
   },
 });
 
