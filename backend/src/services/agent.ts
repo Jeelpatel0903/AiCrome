@@ -107,8 +107,11 @@ export async function runAgent(params: {
     },
   ];
 
-  const MAX_ITERATIONS = 50;
+  const MAX_ITERATIONS = 30;
+  // Abort if the same tool fails this many times in a row (e.g. snapshot timeout loop)
+  const MAX_CONSECUTIVE_ERRORS = 3;
   let iteration = 0;
+  let consecutiveErrors = 0;
 
   try {
     await sendProgress('message', `Starting task: ${command}`);
@@ -117,7 +120,7 @@ export async function runAgent(params: {
       iteration++;
 
       if (session.cancelRequested) {
-        await sendProgress('message', 'Task cancelled by user.');
+        await sendProgress('complete', 'Task cancelled.');
         session.status = 'cancelled';
         break;
       }
@@ -137,6 +140,7 @@ export async function runAgent(params: {
         if (response.textContent) {
           await sendProgress('message', response.textContent);
         }
+        await sendProgress('complete', response.textContent ?? 'Done.');
         session.status = 'completed';
         break;
       }
@@ -149,8 +153,20 @@ export async function runAgent(params: {
 
           if (result.success) {
             await sendProgress('tool_success', `✅ ${toolCall.name} completed`);
+            consecutiveErrors = 0; // reset on success
           } else {
             await sendProgress('tool_error', `❌ ${toolCall.name} failed: ${result.error}`);
+            consecutiveErrors++;
+
+            // Safety valve: if tools keep failing (e.g. snapshot timeout loop), abort
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+              await sendProgress(
+                'error',
+                `Task stopped: ${consecutiveErrors} consecutive tool failures. Last error: ${result.error ?? 'unknown'}. Make sure you are on a regular web page (not chrome:// or a new tab).`,
+              );
+              session.status = 'failed';
+              return;
+            }
           }
 
           // Push tool result in the format this provider expects

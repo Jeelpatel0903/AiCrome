@@ -27,10 +27,10 @@ export interface PageSnapshot {
 const INTERACTIVE_SELECTORS =
   'a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="menuitem"], [role="tab"], [role="combobox"], [contenteditable="true"]';
 
-function isVisible(el: Element): boolean {
-  const htmlEl = el as HTMLElement;
-  if (htmlEl.offsetParent !== null) return true;
-  const rect = el.getBoundingClientRect();
+function isVisibleByRect(el: Element, rect: DOMRect): boolean {
+  // Fast check first (no layout trigger)
+  if ((el as HTMLElement).offsetParent !== null) return true;
+  // Fallback to dimensions
   return rect.width > 0 && rect.height > 0;
 }
 
@@ -101,18 +101,27 @@ function inferRole(el: Element): string {
 
 
 // Max interactive elements returned per snapshot (keeps token usage manageable)
-const MAX_SNAPSHOT_ELEMENTS = 200;
+const MAX_SNAPSHOT_ELEMENTS = 150;
 
 export function buildSnapshot(): PageSnapshot {
   const candidates = Array.from(document.querySelectorAll(INTERACTIVE_SELECTORS));
-  const visible = candidates.filter(isVisible);
 
-  // Sort viewport-first: elements closer to the top of the visible area come first
+  // Read ALL rects in ONE batch pass — avoids repeated layout thrashing.
+  // getBoundingClientRect() forces layout; calling it once per element and
+  // caching is O(n), versus calling it inside a sort comparator which is O(n log n).
+  const rectMap = new Map<Element, DOMRect>();
+  for (const el of candidates) {
+    rectMap.set(el, el.getBoundingClientRect());
+  }
+
+  // Filter to visible elements using cached rects — no extra layout triggers
+  const visible = candidates.filter((el) => isVisibleByRect(el, rectMap.get(el)!));
+
+  // Sort viewport-first using cached rects — no additional getBoundingClientRect calls
   const viewportH = window.innerHeight;
   visible.sort((a, b) => {
-    const aY = a.getBoundingClientRect().top;
-    const bY = b.getBoundingClientRect().top;
-    // In-viewport elements (0 ≤ top < viewportH) first, then below-fold
+    const aY = rectMap.get(a)!.top;
+    const bY = rectMap.get(b)!.top;
     const aInView = aY >= 0 && aY < viewportH ? 0 : 1;
     const bInView = bY >= 0 && bY < viewportH ? 0 : 1;
     if (aInView !== bInView) return aInView - bInView;
@@ -141,18 +150,17 @@ export function buildSnapshot(): PageSnapshot {
     const value =
       ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) ? htmlInputEl.value ?? '' : undefined;
     const disabled = (el as HTMLInputElement).disabled ?? false;
-    const elVisible = isVisible(el);
 
-    const rect = el.getBoundingClientRect();
+    // Use the already-cached rect — zero extra layout cost
+    const rect = rectMap.get(el)!;
     const boundingBox = {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
     };
+    const elVisible = isVisibleByRect(el, rect);
 
-    // Note: cssSelector and xpath are expensive to compute and not needed for
-    // ref-based interactions. Skip them to keep snapshot fast.
     const ref_: ElementRef = {
       ref,
       tag,
