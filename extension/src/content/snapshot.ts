@@ -10,8 +10,8 @@ export interface ElementRef {
   disabled: boolean;
   visible: boolean;
   boundingBox: { x: number; y: number; width: number; height: number };
-  cssSelector: string;
-  xpath: string;
+  cssSelector?: string;
+  xpath?: string;
 }
 
 export interface PageSnapshot {
@@ -99,71 +99,32 @@ function inferRole(el: Element): string {
   }
 }
 
-function buildCssSelector(el: Element): string {
-  const id = el.getAttribute('id');
-  if (id) return `#${CSS.escape(id)}`;
 
-  const parts: string[] = [];
-  let current: Element | null = el;
-
-  while (current && current !== document.documentElement) {
-    const node: Element = current;
-    const parent: Element | null = node.parentElement;
-    if (!parent) break;
-
-    const tag = node.tagName.toLowerCase();
-    const siblings = Array.from(parent.children).filter(
-      (c) => c.tagName === node.tagName,
-    );
-
-    if (siblings.length === 1) {
-      parts.unshift(tag);
-    } else {
-      const index = siblings.indexOf(node) + 1;
-      parts.unshift(`${tag}:nth-of-type(${index})`);
-    }
-    current = parent;
-  }
-
-  return parts.join(' > ');
-}
-
-function buildXPath(el: Element): string {
-  const parts: string[] = [];
-  let current: Element | null = el;
-
-  while (current && current.nodeType === Node.ELEMENT_NODE) {
-    const node: Element = current;
-    const parent: Element | null = node.parentElement;
-    const tag = node.tagName.toLowerCase();
-
-    if (parent) {
-      const siblings = Array.from(parent.children).filter(
-        (c) => c.tagName === node.tagName,
-      );
-      if (siblings.length === 1) {
-        parts.unshift(tag);
-      } else {
-        const index = siblings.indexOf(node) + 1;
-        parts.unshift(`${tag}[${index}]`);
-      }
-    } else {
-      parts.unshift(tag);
-    }
-
-    current = parent;
-  }
-
-  return '/' + parts.join('/');
-}
+// Max interactive elements returned per snapshot (keeps token usage manageable)
+const MAX_SNAPSHOT_ELEMENTS = 200;
 
 export function buildSnapshot(): PageSnapshot {
   const candidates = Array.from(document.querySelectorAll(INTERACTIVE_SELECTORS));
   const visible = candidates.filter(isVisible);
 
+  // Sort viewport-first: elements closer to the top of the visible area come first
+  const viewportH = window.innerHeight;
+  visible.sort((a, b) => {
+    const aY = a.getBoundingClientRect().top;
+    const bY = b.getBoundingClientRect().top;
+    // In-viewport elements (0 ≤ top < viewportH) first, then below-fold
+    const aInView = aY >= 0 && aY < viewportH ? 0 : 1;
+    const bInView = bY >= 0 && bY < viewportH ? 0 : 1;
+    if (aInView !== bInView) return aInView - bInView;
+    return aY - bY;
+  });
+
+  // Cap total elements to avoid huge prompts
+  const capped = visible.slice(0, MAX_SNAPSHOT_ELEMENTS);
+
   let counter = 1;
 
-  const elements: ElementRef[] = visible.map((el) => {
+  const elements: ElementRef[] = capped.map((el) => {
     // Assign ref only if not already set
     if (!el.getAttribute('data-ai-ref')) {
       el.setAttribute('data-ai-ref', `e${counter}`);
@@ -180,7 +141,7 @@ export function buildSnapshot(): PageSnapshot {
     const value =
       ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) ? htmlInputEl.value ?? '' : undefined;
     const disabled = (el as HTMLInputElement).disabled ?? false;
-    const visible = isVisible(el);
+    const elVisible = isVisible(el);
 
     const rect = el.getBoundingClientRect();
     const boundingBox = {
@@ -190,19 +151,16 @@ export function buildSnapshot(): PageSnapshot {
       height: Math.round(rect.height),
     };
 
-    const cssSelector = buildCssSelector(el);
-    const xpath = buildXPath(el);
-
+    // Note: cssSelector and xpath are expensive to compute and not needed for
+    // ref-based interactions. Skip them to keep snapshot fast.
     const ref_: ElementRef = {
       ref,
       tag,
       role,
       name,
       disabled,
-      visible,
+      visible: elVisible,
       boundingBox,
-      cssSelector,
-      xpath,
     };
 
     if (type !== undefined) ref_.type = type;
@@ -227,10 +185,14 @@ export function findElementByRef(ref: string): Element | null {
 }
 
 export function buildSnapshotText(snapshot: PageSnapshot): string {
+  const moreBelow =
+    snapshot.pageHeight > snapshot.scrollY + snapshot.viewportHeight + 50;
+
   const lines: string[] = [
     `Page: ${snapshot.title}`,
     `URL: ${snapshot.url}`,
-    `Scroll: ${snapshot.scrollY}/${snapshot.pageHeight}`,
+    `Viewport: ${snapshot.viewportHeight}px | Scroll: ${snapshot.scrollY}/${snapshot.pageHeight}${moreBelow ? ' (more content below — scroll to see)' : ''}`,
+    `Elements: ${snapshot.elements.length}${snapshot.elements.length >= MAX_SNAPSHOT_ELEMENTS ? ` (capped at ${MAX_SNAPSHOT_ELEMENTS}; scroll to reveal more)` : ''}`,
     '',
     'Interactive elements:',
   ];
@@ -238,8 +200,10 @@ export function buildSnapshotText(snapshot: PageSnapshot): string {
   for (const el of snapshot.elements) {
     const tagStr = el.type ? `${el.tag}[${el.type}]` : el.tag;
     const valueStr = el.value !== undefined ? ` value="${el.value}"` : '';
-    const disabledStr = `(disabled=${el.disabled})`;
-    lines.push(`[@${el.ref}] ${tagStr} "${el.name}"${valueStr} ${disabledStr}`);
+    const disabledStr = el.disabled ? ' [disabled]' : '';
+    const inView = el.boundingBox.y >= 0 && el.boundingBox.y < snapshot.viewportHeight;
+    const viewStr = inView ? '' : ' [below-fold]';
+    lines.push(`[@${el.ref}] ${tagStr} "${el.name}"${valueStr}${disabledStr}${viewStr}`);
   }
 
   return lines.join('\n');
