@@ -274,30 +274,24 @@ export async function runAgent(params: {
     }
 
     if (execIteration >= MAX_EXECUTING && !taskDone) {
-      await sendProgress('error', 'Maximum steps reached. Task stopped.');
-      session.status = 'failed';
-      return;
+      await sendProgress('message', '⚠️ Maximum steps reached — running final verification.');
     }
 
     // ── Phase 4: Verifying ────────────────────────────────────────────────
-    if (!taskDone) {
-      const verifyPrompt = buildVerifyingSystemPrompt(task, world);
-      const verifyResponse = await providerClient.chat({
-        messages: [...messages, { role: 'user', content: 'Verify: has the goal been achieved?' }],
-        tools: [],
-        systemPrompt: verifyPrompt,
-        maxTokens: 256,
-        model: aiConfig.model,
-      });
+    const verifyPrompt = buildVerifyingSystemPrompt(task, world);
+    const verifyResponse = await providerClient.chat({
+      messages: [...messages, { role: 'user', content: 'Verify: has the goal been achieved?' }],
+      tools: [],
+      systemPrompt: verifyPrompt,
+      maxTokens: 256,
+      model: aiConfig.model,
+    });
 
-      const verdict = verifyResponse.textContent ?? '';
-      if (verdict.toUpperCase().startsWith('SUCCESS')) {
-        await sendProgress('complete', verdict.replace(/^SUCCESS:\s*/i, '✅ ').trim());
-      } else {
-        await sendProgress('complete', verdict.replace(/^INCOMPLETE:\s*/i, '⚠️ Almost done — ').trim());
-      }
+    const verdict = verifyResponse.textContent ?? '';
+    if (verdict.toUpperCase().startsWith('SUCCESS')) {
+      await sendProgress('complete', verdict.replace(/^SUCCESS:\s*/i, '✅ ').trim());
     } else {
-      await sendProgress('complete', 'Task completed successfully.');
+      await sendProgress('complete', verdict.replace(/^INCOMPLETE:\s*/i, '⚠️ Almost done — ').trim());
     }
 
     session.status = 'completed';
