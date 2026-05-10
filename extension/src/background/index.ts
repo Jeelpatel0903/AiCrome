@@ -1,145 +1,379 @@
-// Background service worker
+/**
+ * DevFlow AI — Background Service Worker
+ *
+ * Architecture note: ALL page interactions use chrome.scripting.executeScript()
+ * instead of chrome.tabs.sendMessage() + content script callbacks.
+ *
+ * Why: ws.onmessage is NOT a Chrome API event, so Chrome may terminate the
+ * service worker before the sendMessage callback chain completes, causing 60s
+ * bridge timeouts.  executeScript() is awaited as a Promise and Chrome keeps
+ * the service worker alive for the duration — guaranteed.
+ */
+
+// ─── State ───────────────────────────────────────────────────────────────────
 
 let ws: WebSocket | null = null;
 let userId: string | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectDelay = 2000; // exponential back-off: 2s → 4s → 8s → … → 60s
+let reconnectDelay = 2000;
 
-// Declare VITE_BACKEND_URL as it's injected by Vite
-declare const VITE_BACKEND_URL: string;
-
-// ─── Track the last active HTTP/HTTPS tab ───────────────────────────────────
-// chrome.tabs.query({ active: true, currentWindow: true }) is unreliable from a
-// service worker — it returns the sidepanel "window" (which has no tabs) once
-// the sidepanel gains focus.  Instead we track the last HTTP tab ourselves.
-
+// Track the last HTTP tab the user was on.
+// chrome.tabs.query({ active: true, currentWindow: true }) is unreliable from
+// a service worker when the sidepanel has focus — this is more reliable.
 let lastActiveTabId: number | null = null;
 
-function isHttpUrl(url?: string): boolean {
+declare const VITE_BACKEND_URL: string;
+
+// ─── Tab tracking ─────────────────────────────────────────────────────────────
+
+function isHttp(url?: string): boolean {
   return !!(url?.startsWith('http://') || url?.startsWith('https://'));
 }
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   chrome.tabs.get(tabId, (tab) => {
-    if (chrome.runtime.lastError) return;
-    if (isHttpUrl(tab.url)) lastActiveTabId = tabId;
+    if (!chrome.runtime.lastError && isHttp(tab?.url)) lastActiveTabId = tabId;
   });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
-  if (info.status === 'complete' && tab.active && isHttpUrl(tab.url)) {
+  if (info.status === 'complete' && tab.active && isHttp(tab.url)) {
     lastActiveTabId = tabId;
   }
 });
 
-// ─── Find the best target tab for bridge actions ─────────────────────────────
+// ─── Find the right tab for bridge actions ────────────────────────────────────
 
 function getTargetTab(): Promise<chrome.tabs.Tab | null> {
   return new Promise((resolve) => {
-    // 1. Try the last tab we tracked
     if (lastActiveTabId !== null) {
       const id = lastActiveTabId;
       chrome.tabs.get(id, (tab) => {
-        if (!chrome.runtime.lastError && isHttpUrl(tab?.url)) {
-          resolve(tab);
-          return;
-        }
-        lastActiveTabId = null; // stale — forget it
-        findFallbackTab(resolve);
+        if (!chrome.runtime.lastError && isHttp(tab?.url)) { resolve(tab); return; }
+        lastActiveTabId = null;
+        queryFallbackTab(resolve);
       });
     } else {
-      findFallbackTab(resolve);
+      queryFallbackTab(resolve);
     }
   });
 }
 
-function findFallbackTab(resolve: (t: chrome.tabs.Tab | null) => void): void {
-  // 2. Active tab in the last focused window
+function queryFallbackTab(resolve: (t: chrome.tabs.Tab | null) => void): void {
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-    const httpTab = tabs.find((t) => isHttpUrl(t.url));
-    if (httpTab) {
-      lastActiveTabId = httpTab.id ?? null;
-      resolve(httpTab);
-      return;
-    }
-    // 3. Any active HTTP tab across all windows
-    chrome.tabs.query({ active: true }, (allTabs) => {
-      const anyHttp = allTabs.find((t) => isHttpUrl(t.url));
-      if (anyHttp) {
-        lastActiveTabId = anyHttp.id ?? null;
-        resolve(anyHttp);
-        return;
-      }
+    const t = tabs.find((x) => isHttp(x.url));
+    if (t) { lastActiveTabId = t.id ?? null; resolve(t); return; }
+    chrome.tabs.query({ active: true }, (all) => {
+      const t2 = all.find((x) => isHttp(x.url));
+      if (t2) { lastActiveTabId = t2.id ?? null; resolve(t2); return; }
       resolve(null);
     });
   });
 }
 
-// ─── Send a bridge result back to the backend ────────────────────────────────
+// ─── Bridge result ────────────────────────────────────────────────────────────
 
-function sendBridgeResult(
-  requestId: string,
-  result: { success: boolean; data?: Record<string, unknown>; error?: string },
-): void {
+type BridgeResult = { success: boolean; data?: Record<string, unknown>; error?: string };
+
+function sendBridgeResult(requestId: string, result: BridgeResult): void {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'bridge_result', requestId, ...result }));
   }
 }
 
-// ─── Route an action to the content script with auto-injection fallback ──────
+// ─── Page action functions (injected via executeScript) ───────────────────────
+// These MUST be self-contained — no closures over external variables.
 
-function sendToContentScript(
-  tabId: number,
-  msg: object,
-  requestId: string,
-): void {
-  const trySend = (attempt: number) => {
-    chrome.tabs.sendMessage(
-      tabId,
-      msg,
-      (response: { success: boolean; data?: Record<string, unknown>; error?: string } | undefined) => {
-        if (chrome.runtime.lastError) {
-          const err = chrome.runtime.lastError.message ?? '';
-          const canInject =
-            attempt === 1 &&
-            (err.includes('Receiving end does not exist') ||
-              err.includes('Could not establish connection'));
+function _pageSnapshot(): BridgeResult {
+  try {
+    const SEL = 'a[href],button,input:not([type="hidden"]),select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="menuitem"],[role="tab"],[role="combobox"],[contenteditable="true"]';
+    const MAX = 150;
+    const candidates = Array.from(document.querySelectorAll(SEL));
 
-          if (canInject) {
-            // Inject content script once, then retry
-            chrome.scripting
-              .executeScript({ target: { tabId }, files: ['content.js'] })
-              .then(() => setTimeout(() => trySend(2), 400))
-              .catch((e: unknown) =>
-                sendBridgeResult(requestId, {
-                  success: false,
-                  error: `Content script injection failed: ${String(e)}`,
-                }),
-              );
-          } else {
-            sendBridgeResult(requestId, { success: false, error: err || 'Content script error' });
-          }
-          return;
-        }
-        sendBridgeResult(
-          requestId,
-          response ?? { success: false, error: 'No response from content script' },
-        );
-      },
-    );
-  };
-  trySend(1);
+    // Batch-read all rects ONCE to avoid repeated layout reflows
+    const rects = new Map<Element, DOMRect>();
+    for (const el of candidates) rects.set(el, el.getBoundingClientRect());
+
+    const visible = candidates.filter((el) => {
+      const r = rects.get(el)!;
+      return (el as HTMLElement).offsetParent !== null || (r.width > 0 && r.height > 0);
+    });
+
+    const vh = window.innerHeight;
+    visible.sort((a, b) => {
+      const aY = rects.get(a)!.top, bY = rects.get(b)!.top;
+      const aIn = aY >= 0 && aY < vh ? 0 : 1, bIn = bY >= 0 && bY < vh ? 0 : 1;
+      return aIn !== bIn ? aIn - bIn : aY - bY;
+    });
+
+    // Clear old refs first
+    document.querySelectorAll('[data-ai-ref]').forEach((e) => e.removeAttribute('data-ai-ref'));
+
+    const capped = visible.slice(0, MAX);
+    const more = visible.length > MAX;
+    const moreBelow = document.documentElement.scrollHeight > scrollY + vh + 50;
+
+    const lines: string[] = [
+      `Page: ${document.title}`,
+      `URL: ${location.href}`,
+      `Viewport: ${vh}px | Scroll: ${Math.round(scrollY)}/${document.documentElement.scrollHeight}${moreBelow ? ' (more below)' : ''}`,
+      `Elements: ${capped.length}${more ? ` of ${visible.length} (scroll for more)` : ''}`,
+      '',
+      'Interactive elements:',
+    ];
+
+    for (let i = 0; i < capped.length; i++) {
+      const el = capped[i];
+      const ref = `e${i + 1}`;
+      el.setAttribute('data-ai-ref', ref);
+
+      const tag = el.tagName.toUpperCase();
+      const inp = el as HTMLInputElement;
+      const type = inp.type || undefined;
+      const tagStr = type ? `${tag}[${type}]` : tag;
+
+      let name =
+        el.getAttribute('aria-label') ||
+        el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby')!)?.textContent?.trim() ||
+        el.textContent?.trim().replace(/\s+/g, ' ').slice(0, 80) ||
+        inp.placeholder ||
+        el.getAttribute('title') ||
+        el.getAttribute('name') ||
+        '';
+      name = String(name).replace(/\s+/g, ' ').trim();
+
+      const value = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) ? inp.value : undefined;
+      const disabled = inp.disabled || false;
+      const rect = rects.get(el)!;
+      const inView = rect.top >= 0 && rect.top < vh;
+
+      lines.push(
+        `[@${ref}] ${tagStr} "${name}"` +
+        (value !== undefined ? ` value="${value}"` : '') +
+        (disabled ? ' [disabled]' : '') +
+        (inView ? '' : ' [below-fold]'),
+      );
+    }
+
+    return { success: true, data: { text: lines.join('\n'), elementCount: capped.length, url: location.href } };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
 }
 
-// ─── WebSocket connection ─────────────────────────────────────────────────────
+function _pageClickRef(ref: string): BridgeResult {
+  try {
+    const el = document.querySelector(`[data-ai-ref="${ref}"]`) as HTMLElement | null;
+    if (!el) return { success: false, error: `Element not found: @${ref}` };
+    el.focus();
+    el.click();
+    return { success: true, data: { clicked: el.tagName, ref } };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
+
+function _pageTypeRef(ref: string, text: string, clearFirst: boolean): BridgeResult {
+  try {
+    const el = document.querySelector(`[data-ai-ref="${ref}"]`) as HTMLInputElement | null;
+    if (!el) return { success: false, error: `Element not found: @${ref}` };
+    if (!['INPUT', 'TEXTAREA'].includes(el.tagName)) return { success: false, error: `@${ref} is not an input (${el.tagName})` };
+
+    el.focus();
+    if (clearFirst) {
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, text);
+    else el.value = text;
+
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+    return { success: true, data: { typed: text, ref } };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
+
+function _pageScroll(direction: string, amount: number): BridgeResult {
+  try {
+    window.scrollBy(0, direction === 'down' ? amount : -amount);
+    return { success: true, data: { scrolled: direction, amount } };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
+
+function _pagePressKey(key: string): BridgeResult {
+  try {
+    const el = (document.activeElement || document.body) as HTMLElement;
+    el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent('keypress', { key, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+    if (key === 'Enter' && el.tagName === 'INPUT') {
+      (el as HTMLInputElement).form?.dispatchEvent(new Event('submit', { bubbles: true }));
+    }
+    return { success: true, data: { key } };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
+
+function _pageClick(description: string): BridgeResult {
+  try {
+    const desc = description.toLowerCase();
+    const all = document.querySelectorAll('button,input,select,textarea,a,[role="button"],[role="link"],[onclick],label');
+    for (const el of all) {
+      const text = (el.textContent || '').toLowerCase().trim();
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      const ph = ((el as HTMLInputElement).placeholder || '').toLowerCase();
+      const title = (el.getAttribute('title') || '').toLowerCase();
+      if (text.includes(desc) || aria.includes(desc) || ph.includes(desc) || title.includes(desc)) {
+        (el as HTMLElement).click();
+        return { success: true, data: { clicked: el.tagName, text: el.textContent?.trim() } };
+      }
+    }
+    return { success: false, error: `Element not found: ${description}` };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  }
+}
+
+function _pageCheckCondition(condition: { type: string; ref?: string; text?: string; substring?: string }): { met: boolean } {
+  try {
+    switch (condition.type) {
+      case 'element-visible': {
+        const el = condition.ref ? document.querySelector(`[data-ai-ref="${condition.ref}"]`) : null;
+        return { met: el ? (el as HTMLElement).offsetParent !== null || el.getBoundingClientRect().width > 0 : false };
+      }
+      case 'element-gone': {
+        const el = condition.ref ? document.querySelector(`[data-ai-ref="${condition.ref}"]`) : null;
+        return { met: el === null };
+      }
+      case 'text-present':
+        return { met: condition.text ? document.body.textContent?.includes(condition.text) ?? false : false };
+      case 'url-contains':
+        return { met: condition.substring ? location.href.includes(condition.substring) : false };
+      case 'network-idle':
+        return { met: document.readyState === 'complete' };
+      default:
+        return { met: false };
+    }
+  } catch {
+    return { met: false };
+  }
+}
+
+// ─── Execute an action in a tab via executeScript ─────────────────────────────
+
+async function runInTab(tabId: number, requestId: string, action: string, params: Record<string, unknown>): Promise<void> {
+  try {
+    let results: chrome.scripting.InjectionResult[];
+
+    switch (action) {
+      case 'snapshot':
+      case 'get_snapshot':
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageSnapshot });
+        break;
+
+      case 'click_ref': {
+        const ref = String(params.ref ?? '').replace('@', '');
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageClickRef, args: [ref] });
+        // Small settle delay after click
+        await new Promise((r) => setTimeout(r, 400));
+        break;
+      }
+
+      case 'type_ref': {
+        const ref = String(params.ref ?? '').replace('@', '');
+        const text = String(params.text ?? '');
+        const clearFirst = params.clearFirst !== false;
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageTypeRef, args: [ref, text, clearFirst] });
+        break;
+      }
+
+      case 'click': {
+        const description = String(params.description ?? '');
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageClick, args: [description] });
+        await new Promise((r) => setTimeout(r, 400));
+        break;
+      }
+
+      case 'scroll': {
+        const direction = String(params.direction ?? 'down');
+        const amount = Number(params.amount ?? 300);
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pageScroll, args: [direction, amount] });
+        break;
+      }
+
+      case 'pressKey': {
+        const key = String(params.key ?? 'Enter');
+        results = await chrome.scripting.executeScript({ target: { tabId }, func: _pagePressKey, args: [key] });
+        await new Promise((r) => setTimeout(r, 400));
+        break;
+      }
+
+      case 'wait': {
+        const condition = params.condition as { type: string; ref?: string; text?: string; substring?: string; ms?: number };
+        const timeoutMs = Number(params.timeoutMs ?? 25000);
+
+        // Handle delay directly (no DOM check needed)
+        if (condition.type === 'delay') {
+          const ms = Math.min(condition.ms ?? 1000, 30000);
+          await new Promise((r) => setTimeout(r, ms));
+          sendBridgeResult(requestId, { success: true, data: { elapsed: ms } });
+          return;
+        }
+
+        // Poll DOM condition using executeScript
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          const pollResults = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: _pageCheckCondition,
+            args: [condition],
+          });
+          const { met } = (pollResults[0]?.result ?? { met: false }) as { met: boolean };
+          if (met) {
+            sendBridgeResult(requestId, { success: true, data: { elapsed: Date.now() - start } });
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 600));
+        }
+        sendBridgeResult(requestId, { success: false, error: `Wait condition '${condition.type}' not met after ${timeoutMs}ms` });
+        return;
+      }
+
+      default:
+        sendBridgeResult(requestId, { success: false, error: `Unknown action: ${action}` });
+        return;
+    }
+
+    const result = (results[0]?.result ?? { success: false, error: 'No result from page' }) as BridgeResult;
+    sendBridgeResult(requestId, result);
+
+  } catch (err) {
+    const msg = String(err);
+    // executeScript throws if tab is non-injectable (e.g. chrome://, pdf)
+    sendBridgeResult(requestId, {
+      success: false,
+      error: msg.includes('Cannot access') || msg.includes('not allowed')
+        ? `Cannot inject script on this page type. Navigate to a regular http/https website first.`
+        : msg,
+    });
+  }
+}
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
 
 function connectWebSocket(uid: string, token: string): void {
   if (ws && ws.readyState === WebSocket.OPEN) return;
-
   userId = uid;
-  const backendUrl = (
-    typeof VITE_BACKEND_URL !== 'undefined' ? VITE_BACKEND_URL : 'http://localhost:3000'
-  )
+
+  const backendUrl = (typeof VITE_BACKEND_URL !== 'undefined' ? VITE_BACKEND_URL : 'http://localhost:3000')
     .replace('http://', 'ws://')
     .replace('https://', 'wss://');
 
@@ -155,165 +389,143 @@ function connectWebSocket(uid: string, token: string): void {
     ws = null;
     const delay = reconnectDelay;
     reconnectDelay = Math.min(reconnectDelay * 2, 60000);
-    console.log(`DevFlow AI: WS disconnected, retrying in ${delay / 1000}s…`);
+    console.log(`DevFlow AI: WS disconnected, retry in ${delay / 1000}s`);
     reconnectTimer = setTimeout(() => {
       chrome.storage.local.get(['userId', 'authToken'], (r) => {
-        if (r.userId && r.authToken) {
-          connectWebSocket(r.userId as string, r.authToken as string);
-        }
+        if (r.userId && r.authToken) connectWebSocket(r.userId as string, r.authToken as string);
       });
     }, delay);
   };
 
-  ws.onerror = (err) => console.error('DevFlow AI WebSocket error:', err);
+  ws.onerror = (e) => console.error('DevFlow AI WS error:', e);
 
   ws.onmessage = (event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data as string) as {
-        type: string;
-        sessionId: string;
-        message: string;
-        timestamp: string;
+        type: string; sessionId: string; message: string; timestamp: string;
       };
 
-      // Forward all messages to sidepanel (type_ preserves original server type)
-      chrome.runtime
-        .sendMessage({ ...msg, type_: msg.type, type: 'progress_update' })
-        .catch(() => {/* sidepanel may not be open */});
+      // Forward to sidepanel (type_ preserves server's original type)
+      chrome.runtime.sendMessage({ ...msg, type_: msg.type, type: 'progress_update' }).catch(() => {});
 
       if (msg.type !== 'bridge_request') return;
 
-      const bridgeReq = JSON.parse(msg.message) as {
-        requestId: string;
-        action: string;
-        params: Record<string, unknown>;
+      const { requestId, action, params } = JSON.parse(msg.message) as {
+        requestId: string; action: string; params: Record<string, unknown>;
       };
-      const { requestId, action, params } = bridgeReq;
 
-      // ── Screenshot ────────────────────────────────────────────────────────
-      if (action === 'screenshot') {
-        getTargetTab().then((tab) => {
-          const captureOpts: Parameters<typeof chrome.tabs.captureVisibleTab>[1] = { format: 'png' };
-          const captureWindowId = tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT;
-          chrome.tabs.captureVisibleTab(captureWindowId, captureOpts, (dataUrl) => {
-            if (chrome.runtime.lastError) {
-              sendBridgeResult(requestId, { success: false, error: chrome.runtime.lastError.message ?? 'Screenshot failed' });
-              return;
-            }
-            sendBridgeResult(requestId, {
-              success: true,
-              data: { screenshot: dataUrl, url: tab?.url ?? '', title: tab?.title ?? '' },
-            });
-          });
-        }).catch(() => sendBridgeResult(requestId, { success: false, error: 'Screenshot: could not find target tab' }));
-        return;
-      }
-
-      // ── Navigate current tab ──────────────────────────────────────────────
-      if (action === 'navigate') {
-        const url = params.url as string;
-        getTargetTab().then((tab) => {
-          if (!tab?.id) {
-            sendBridgeResult(requestId, {
-              success: false,
-              error: 'No active browser tab found. Please open a webpage first.',
-            });
-            return;
-          }
-          const tabId = tab.id;
-          chrome.tabs.update(tabId, { url }, () => {
-            if (chrome.runtime.lastError) {
-              sendBridgeResult(requestId, {
-                success: false,
-                error: chrome.runtime.lastError.message ?? 'Navigation failed',
-              });
-              return;
-            }
-            lastActiveTabId = tabId;
-            waitForTabLoad(tabId, requestId, url, 20_000);
-          });
-        }).catch(() => sendBridgeResult(requestId, { success: false, error: 'navigate: could not find target tab' }));
-        return;
-      }
-
-      // ── Open URL in a new tab ─────────────────────────────────────────────
-      if (action === 'newtab') {
-        const url = params.url as string;
-        chrome.tabs.create({ url, active: true }, (newTab) => {
-          if (chrome.runtime.lastError || !newTab?.id) {
-            sendBridgeResult(requestId, {
-              success: false,
-              error: chrome.runtime.lastError?.message ?? 'Could not create tab',
-            });
-            return;
-          }
-          lastActiveTabId = newTab.id;
-          waitForTabLoad(newTab.id, requestId, url, 25_000);
-        });
-        return;
-      }
-
-      // ── Content-script actions (snapshot, click_ref, type_ref, wait, …) ──
-      getTargetTab().then((tab) => {
-        if (!tab?.id) {
-          sendBridgeResult(requestId, {
-            success: false,
-            error: 'No active browser tab found. Please open a webpage first.',
-          });
-          return;
-        }
-        if (!isHttpUrl(tab.url)) {
-          sendBridgeResult(requestId, {
-            success: false,
-            error: `Cannot interact with ${tab.url?.split(':')[0] ?? 'this'}: pages. Navigate to an http/https website first.`,
-          });
-          return;
-        }
-        sendToContentScript(
-          tab.id,
-          { type: 'devflow_action', requestId, action, params },
-          requestId,
-        );
-      }).catch(() => sendBridgeResult(requestId, { success: false, error: 'Could not find target tab' }));
+      // Handle bridge request asynchronously.
+      // We use void + a self-contained async function so the service worker
+      // stays alive because of the outstanding chrome API promises inside it.
+      void handleBridgeRequest(requestId, action, params);
 
     } catch (err) {
-      console.error('Error handling WebSocket message:', err);
+      console.error('WS onmessage error:', err);
     }
   };
 }
 
-// ─── Wait for a tab to finish loading, then send bridge_result ───────────────
-
-function waitForTabLoad(
-  tabId: number,
+async function handleBridgeRequest(
   requestId: string,
-  url: string,
-  timeoutMs: number,
-): void {
-  let done = false;
+  action: string,
+  params: Record<string, unknown>,
+): Promise<void> {
+  try {
+    // ── Screenshot ────────────────────────────────────────────────────────────
+    if (action === 'screenshot') {
+      const tab = await getTargetTab();
+      chrome.tabs.captureVisibleTab(
+        tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT,
+        { format: 'png' },
+        (dataUrl) => {
+          if (chrome.runtime.lastError) {
+            sendBridgeResult(requestId, { success: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          sendBridgeResult(requestId, {
+            success: true,
+            data: { screenshot: dataUrl, url: tab?.url ?? '', title: tab?.title ?? '' },
+          });
+        },
+      );
+      return;
+    }
 
+    // ── Open new tab ──────────────────────────────────────────────────────────
+    if (action === 'newtab') {
+      const url = params.url as string;
+      chrome.tabs.create({ url, active: true }, (newTab) => {
+        if (chrome.runtime.lastError || !newTab?.id) {
+          sendBridgeResult(requestId, { success: false, error: chrome.runtime.lastError?.message ?? 'Could not create tab' });
+          return;
+        }
+        lastActiveTabId = newTab.id;
+        waitForLoad(newTab.id, requestId, url, 25_000);
+      });
+      return;
+    }
+
+    // ── Navigate current tab ──────────────────────────────────────────────────
+    if (action === 'navigate') {
+      const url = params.url as string;
+      const tab = await getTargetTab();
+      if (!tab?.id) {
+        sendBridgeResult(requestId, { success: false, error: 'No active browser tab found. Open a webpage first.' });
+        return;
+      }
+      chrome.tabs.update(tab.id, { url }, () => {
+        if (chrome.runtime.lastError) {
+          sendBridgeResult(requestId, { success: false, error: chrome.runtime.lastError.message ?? 'Navigation failed' });
+          return;
+        }
+        lastActiveTabId = tab.id!;
+        waitForLoad(tab.id!, requestId, url, 20_000);
+      });
+      return;
+    }
+
+    // ── All page interactions via executeScript ────────────────────────────────
+    const tab = await getTargetTab();
+    if (!tab?.id) {
+      sendBridgeResult(requestId, { success: false, error: 'No active browser tab found. Open a webpage first.' });
+      return;
+    }
+    if (!isHttp(tab.url)) {
+      sendBridgeResult(requestId, {
+        success: false,
+        error: `Cannot interact with ${(tab.url ?? '').split(':')[0]}:// pages. Navigate to an http/https site first.`,
+      });
+      return;
+    }
+
+    await runInTab(tab.id, requestId, action, params);
+
+  } catch (err) {
+    sendBridgeResult(requestId, { success: false, error: String(err) });
+  }
+}
+
+// ─── Wait for tab navigation to complete ─────────────────────────────────────
+
+function waitForLoad(tabId: number, requestId: string, url: string, ms: number): void {
+  let done = false;
   const finish = (note?: string) => {
     if (done) return;
     done = true;
     chrome.tabs.onUpdated.removeListener(listener);
-    sendBridgeResult(requestId, {
-      success: true,
-      data: { navigated: url, tabId, ...(note ? { note } : {}) },
-    });
+    sendBridgeResult(requestId, { success: true, data: { navigated: url, tabId, ...(note ? { note } : {}) } });
   };
-
-  const listener = (updatedTabId: number, info: chrome.tabs.TabChangeInfo) => {
-    if (updatedTabId === tabId && info.status === 'complete') finish();
+  const listener = (id: number, info: chrome.tabs.TabChangeInfo) => {
+    if (id === tabId && info.status === 'complete') finish();
   };
-
   chrome.tabs.onUpdated.addListener(listener);
-  setTimeout(() => finish('timeout'), timeoutMs);
+  setTimeout(() => finish('timeout'), ms);
 }
 
 // ─── Chrome event listeners ───────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('DevFlow AI extension installed');
+  console.log('DevFlow AI: installed');
   chrome.sidePanel.setOptions({ enabled: true });
 });
 
@@ -321,58 +533,43 @@ chrome.action.onClicked.addListener((tab) => {
   if (tab.id) chrome.sidePanel.open({ tabId: tab.id });
 });
 
-// Keep the MV3 service worker alive while the sidepanel is open.
-// The sidepanel connects a port on load and disconnects on close.
-// A connected port prevents Chrome from killing the service worker.
+// Keep service worker alive while sidepanel is open (port from SidePanel component)
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'keepalive') {
-    // Just holding the port reference keeps the service worker alive.
     port.onDisconnect.addListener(() => {/* sidepanel closed */});
   }
 });
 
 chrome.runtime.onMessage.addListener(
-  (
-    message: { type: string; userId?: string; token?: string; url?: string },
-    _sender,
-    sendResponse,
-  ) => {
-    if (message.type === 'auth_changed' && message.userId && message.token) {
-      connectWebSocket(message.userId, message.token);
+  (msg: { type: string; userId?: string; token?: string; url?: string }, _sender, sendResponse) => {
+    if (msg.type === 'auth_changed' && msg.userId && msg.token) {
+      connectWebSocket(msg.userId, msg.token);
       sendResponse({ success: true });
-    } else if (message.type === 'auth_logout') {
-      ws?.close();
-      ws = null;
-      userId = null;
+    } else if (msg.type === 'auth_logout') {
+      ws?.close(); ws = null; userId = null;
       sendResponse({ success: true });
-    } else if (message.type === 'get_ws_status') {
+    } else if (msg.type === 'get_ws_status') {
       sendResponse({ connected: ws?.readyState === WebSocket.OPEN, userId });
-    } else if (message.type === 'take_screenshot') {
+    } else if (msg.type === 'take_screenshot') {
       chrome.tabs.captureVisibleTab({ format: 'png' }, (dataUrl) => {
         sendResponse({ success: true, dataUrl });
       });
-      return true; // async
-    } else if (message.type === 'devflow_navigate' && message.url) {
+      return true;
+    } else if (msg.type === 'devflow_navigate' && msg.url) {
       chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-        const tab = tabs[0] ?? null;
-        if (tab?.id) {
-          chrome.tabs.update(tab.id, { url: message.url as string });
-          sendResponse({ success: true });
-        } else {
-          sendResponse({ success: false, error: 'No active tab' });
-        }
+        const t = tabs[0];
+        if (t?.id) { chrome.tabs.update(t.id, { url: msg.url as string }); sendResponse({ success: true }); }
+        else sendResponse({ success: false, error: 'No active tab' });
       });
-      return true; // async
+      return true;
     }
     return true;
   },
 );
 
-// On startup, reconnect if we have stored credentials
-chrome.storage.local.get(['userId', 'authToken'], (result) => {
-  if (result.userId && result.authToken) {
-    connectWebSocket(result.userId as string, result.authToken as string);
-  }
+// Reconnect on startup
+chrome.storage.local.get(['userId', 'authToken'], (r) => {
+  if (r.userId && r.authToken) connectWebSocket(r.userId as string, r.authToken as string);
 });
 
 export {};
